@@ -3,6 +3,7 @@ from requests.adapters import HTTPAdapter
 from requests_oauthlib import OAuth2Session
 from urllib3.util.retry import Retry
 import json
+import os
 
 ## ############################################################################
 ## Global config
@@ -10,8 +11,9 @@ import json
 
 credentials_file = Path('./credentials.json')
 saved_token_file = Path('./access_token.json')
+mac_photos_dir = Path('/Users/gareth/Pictures/Photos Library.photoslibrary/Masters')
 max_retries_per_request = 3
-media_items_list_page_size = 5
+media_items_list_page_size = 25
 authorization_base_url = "https://accounts.google.com/o/oauth2/v2/auth"
 scopes = ['https://www.googleapis.com/auth/photoslibrary.readonly']
 
@@ -172,15 +174,29 @@ response = session.get('https://photoslibrary.googleapis.com/v1/mediaItems',
                        headers={'Authorization': 'Bearer '+token['access_token']})
 next_page_token = parse_get_mediaitems_response(response, photos)
 
-# Repeat whilst Google returns a token indicating more items to come
-while next_page_token != None:
-    response = session.get('https://photoslibrary.googleapis.com/v1/mediaItems',
-                       headers={'Authorization': 'Bearer '+token['access_token']},
-                       params={'pageToken': next_page_token})
-    next_page_token = parse_get_mediaitems_response(response, photos)
+# TODO uncomment:
 
+# Repeat whilst Google returns a token indicating more items to come
+#while next_page_token != None:
+#    print('Got',len(photos),'. Fetching next page with token',next_page_token,'...')
+#    response = session.get('https://photoslibrary.googleapis.com/v1/mediaItems',
+#                       headers={'Authorization': 'Bearer '+token['access_token']},
+#                       params={'pageToken': next_page_token})
+#    next_page_token = parse_get_mediaitems_response(response, photos)
     
-print ('Num photos returned:',len(photos))
+print (len(photos),'photos found in Google Photos online')
+    
+# Inspect filesystem for photo files
+photo_files_on_disk = dict()
+for (dirpath, dirnames, filenames) in os.walk(mac_photos_dir):
+    for filename in filenames:
+        photo_files_on_disk[filename] = os.path.join(dirpath, filename)
+print (len(photo_files_on_disk),'files found in Photos library on disk')
+
+# Compare filenames from Google and filesystem
+photos_to_download = dict()
 for filename in photos:
-    print(filename)
+    if filename not in photo_files_on_disk:
+        photos_to_download[filename] = photos[filename]
+print(len(photos_to_download),'photos need to be downloaded from Google')
 
