@@ -2,10 +2,14 @@ from pathlib import Path
 from requests.adapters import HTTPAdapter
 from requests_oauthlib import OAuth2Session
 from urllib3.util.retry import Retry
+import applescript
 import argparse
 import json
 import os
+import shutil
 import sys
+import tempfile
+from time import strptime, mktime
 
 ## ############################################################################
 ## Global config
@@ -13,17 +17,18 @@ import sys
 default_cache_dir = Path.home() / '.google-photos-sync-mac'
 default_credentials_file_name = 'credentials.json'
 default_max_retries_per_request = 3
-default_mac_photos_dir = Path.home() / 'Photos Library.photoslibrary'
+default_mac_photos_dir = Path.home() / 'Pictures' / 'Photos Library.photoslibrary'
+default_batch_size = 5
 
 
 saved_token_file_name = 'access_token.json'
+import_applescript_file_name = 'import_photos.applescript'
 
 
-media_items_list_page_size = 10
 authorization_base_url = "https://accounts.google.com/o/oauth2/v2/auth"
 scopes = ['https://www.googleapis.com/auth/photoslibrary.readonly']
 
-# A cache of the contents of saved_token_file. This is "global'd" by load_token
+# A cache of the contents of saved_token_file_name. This is "global'd" by load_token
 # and save_token so that if the token is auto-refreshed by requests_oauthlib
 # then the refreshed value is immediately available to all
 token = None
@@ -34,30 +39,32 @@ token = None
 
 def load_token():
     """Load a previously saved access token from filesystem"""
-    global token
+    global args, token, saved_token_file_name
     
     try:
-        with saved_token_file.open('r') as token_stream:
+        token_file_path = args.cache_dir / saved_token_file_name
+        with token_file_path.open('r') as token_stream:
             token = json.load(token_stream)
     except (json.JSONDecodeError):
-        print('Ignoring badly formatted JSON token file:', saved_token_file)
+        print('Ignoring badly formatted JSON token file:', token_file_path)
         return None
     except (FileNotFoundError):
-        print('No saved token file:', saved_token_file)
+        print('No saved token file:', token_file_path)
         return None
     except (IOError):
-        print('Ignoring inaccessible token file:', saved_token_file)
+        print('Ignoring inaccessible token file:', token_file_path)
         return None
     return token
 
 def save_token(new_token):
     """Persist an access token to the filesystem"""
-    global token, saved_token_file
+    global args, token, saved_token_file_name
     
     token = new_token
-    with saved_token_file.open('w') as token_stream:
+    token_file_path = args.cache_dir / saved_token_file_name
+    with token_file_path.open('w') as token_stream:
         json.dump(new_token, token_stream)
-    saved_token_file.chmod(0o600)
+    token_file_path.chmod(0o600)
 
 def request_new_token(client_id,
                       client_secret,
@@ -66,7 +73,8 @@ def request_new_token(client_id,
                       token_uri, 
                       extra, 
                       authorization_base_url):
-    """Get a completely fresh access token and save it to filesystem"""  
+    """Get a completely fresh access token, save it to filesystem and return a
+    new session. User will be asked to go to Google and grant permission."""  
     
     session = OAuth2Session(client_id, scope=scopes,
                             redirect_uri=redirect_uri,
@@ -145,12 +153,45 @@ def create_session(args, user_token=None):
     
     # GET mediaItems needs Content-type header and pageSize param on every call
     session.headers.update({'Content-type': 'application/json'})
-    session.params.update({'pageSize': media_items_list_page_size})
+    session.params.update({'pageSize': args.batch_size})
 
     # Authorization header will change on token refresh so it must be added
     # separately on each request
     
     return session
+   
+def import_photos(args, directory):
+    
+    directory = Path(directory).resolve()
+    alias = "Macintosh HD"+str(directory).replace('/', ':')
+    
+    # Double braces to escape
+    import_applescript = """-- generated file - do not edit
+
+set importFolder to alias "{}"
+
+tell application "Finder" to set theFiles to every file of importFolder
+
+set imageList to {{}}
+repeat with i from 1 to number of items in theFiles
+    set this_item to item i of theFiles as alias
+    set the end of imageList to this_item
+end repeat
+
+tell application "Photos"
+    activate
+    delay 2
+    import imageList
+end tell
+    
+""".format(alias)
+
+    applescript_file_path = Path(args.cache_dir) / import_applescript_file_name
+    with applescript_file_path.open('w') as stream:
+        stream.write(import_applescript)
+    
+    applescript.run(applescript_file_path, background=False)
+   
     
 def parse_arguments():
     """parses any commandline arguments and returns an object with
@@ -171,7 +212,7 @@ def parse_arguments():
     option (or manually create the directory and place a credentials file
     in it) and also force re-authentication with Google. Directory is created
     if it does not already exist. Defaults to {}.""".format(default_cache_dir),
-    metavar='DIRECTORY', nargs=1, default=default_cache_dir)
+    metavar='DIRECTORY', default=default_cache_dir)
     
     # Raises error if file is specified and does not exist
     parser.add_argument('-c', '--credentials', help="""Use this application
@@ -180,36 +221,43 @@ def parse_arguments():
     argument must be specified the first time this rogram is run (unless a
     credentials file has been first manually placed in the cache directory
     (see --cache-dir)""", type=argparse.FileType('r'), metavar='FILE',
-    dest='credentials_file', nargs=1)
+    dest='credentials_file')
     
     parser.add_argument('-i', '--client-id', help="""Use this string as the
     application client ID when authenticating with Google. Overrides any value
     specified in the cached credentials file or in the file specified with the
-    --credentials option.""", metavar='STRING', nargs=1)
+    --credentials option.""", metavar='STRING')
     
     parser.add_argument('-s', '--client-secret', help="""Use this string as the
     application client secret when authenticating with Google. Overrides any
     value specified in the cached credentials file or in the file specified
-    with the --credentials option.""", metavar='STRING', nargs=1)
+    with the --credentials option.""", metavar='STRING')
     
     parser.add_argument('-r', '--redirect-uri', help="""Use this string as the
     redirect URI when authenticating with Google. Overrides any
     value specified in the cached credentials file or in the file specified
-    with the --credentials option.""", metavar='STRING', nargs=1)
+    with the --credentials option.""", metavar='STRING')
     
     parser.add_argument('-t', '--token-uri', help="""Use this string as the
     token URI when authenticating with Google. Overrides any
     value specified in the cached credentials file or in the file specified
-    with the --credentials option.""", metavar='STRING', nargs=1)
+    with the --credentials option.""", metavar='STRING')
+    
+    parser.add_argument('-b', '--batch-size', help="""When retrieving the list
+    of photos from Google, retrieve in batches of this size. Defaults to {}"""
+    .format(default_batch_size), default=default_batch_size, type=int)
     
     parser.add_argument('-m', '--max-retries', help="""Maximum number of retries
     for each individual GET request to Google. Defaults to {}."""
-    .format(default_max_retries_per_request), nargs=1, type=int,
+    .format(default_max_retries_per_request), type=int,
     default=default_max_retries_per_request)
+    
+    parser.add_argument('-v', '--verbose', help="""Output progress updates.
+    Without this option only errors are outputted.""", action='store_true')
     
     parser.add_argument('-l', '--mac-photos-library', help="""The Photos Library
     or top level directory to scan for existing photos. Defaults to {}."""
-    .format(default_mac_photos_dir), default=default_mac_photos_dir, nargs=1, 
+    .format(default_mac_photos_dir), default=default_mac_photos_dir, 
     type=Path)
     
     args = parser.parse_args()
@@ -218,14 +266,29 @@ def parse_arguments():
         print('{} is not a directory or Photos Library'
               .format(args.mac_photos_library), file=sys.stderr)
         exit(1)
-        
-    try:
-        if args.credentials_file == None:
-            credentials_file_path = args.cache_dir / default_credentials_file_name
-            args.credentials_file = credentials_file_path.open('r')
-    except FileNotFoundError as e:
-        print('Cannot open file {}'.format(e.filename), file=sys.stderr)
-        exit(1)
+    
+    if not args.cache_dir.is_dir():
+        args.cache_dir.mkdir(exist_ok=True)
+    
+    cached_credentials_file_path = args.cache_dir / default_credentials_file_name
+    if args.credentials_file == None:
+        # Use cached credentials file
+        try:
+            args.credentials_file = cached_credentials_file_path.open('r')
+        except FileNotFoundError as e:
+            print('Cannot open file {}'.format(e.filename), file=sys.stderr)
+            exit(1)
+    else:
+        # Using specified credentials file, cache it for subsequent use
+        try:
+            shutil.copyfile(args.credentials_file.name, cached_credentials_file_path)
+        except shutil.SameFileError:
+            print("Cancelled copying specified credentials file: same file",
+                  file=sys.stderr)
+        except IOError as e:
+            print("Failed to copy credentials file {} to cache ({})\n{}"
+                  .format(args.credentials_file.name, cached_credentials_file_path, e))
+            exit(1)
 
     try:
         # Create dict of info contained in credentials file
@@ -284,8 +347,18 @@ def parse_arguments():
 
 args = parse_arguments()
 
+# Inspect filesystem for photo files. Create dict of filename: full_file_path
+photo_files_on_disk = dict()
+for (dirpath, dirnames, filenames) in os.walk(args.mac_photos_library):
+    for filename in filenames:
+        photo_files_on_disk[filename] = os.path.join(dirpath, filename)
+if args.verbose:
+    print (len(photo_files_on_disk),'files found in Photos library on disk')
+
+# TODO make multi user
+
 token = load_token()
-session = create_session(token)
+session = create_session(args, token)
 
 # Dict of filename: photo_metadata_dict
 photos = dict()
@@ -299,25 +372,64 @@ next_page_token = parse_get_mediaitems_response(response, photos)
 
 # Repeat whilst Google returns a token indicating more items to come
 #while next_page_token != None:
-#    print('Got',len(photos),'. Fetching next page with token',next_page_token,'...')
+#    if args.verbose:
+#        print('Got',len(photos),'. Fetching next page with token',next_page_token,'...')
 #    response = session.get('https://photoslibrary.googleapis.com/v1/mediaItems',
 #                       headers={'Authorization': 'Bearer '+token['access_token']},
 #                       params={'pageToken': next_page_token})
 #    next_page_token = parse_get_mediaitems_response(response, photos)
-print (len(photos),'photos found in Google Photos online')
+if args.verbose:
+    print (len(photos),'photos found in Google Photos online')
     
-# Inspect filesystem for photo files. Create dict of filename: full_file_path
-photo_files_on_disk = dict()
-for (dirpath, dirnames, filenames) in os.walk(args.mac_photos_library):
-    for filename in filenames:
-        photo_files_on_disk[filename] = os.path.join(dirpath, filename)
-print (len(photo_files_on_disk),'files found in Photos library on disk')
-
 # Compare filenames from Google and filesystem.
 # Create dict of filename: photo_metadata_dict
 photos_to_download = dict()
 for filename in photos:
     if filename not in photo_files_on_disk:
         photos_to_download[filename] = photos[filename]
-print(len(photos_to_download),'photos need to be downloaded from Google')
+if args.verbose:
+    print(len(photos_to_download),'photos need to be downloaded from Google')
 
+# Download each photo from Google
+for filename, photo_metadata in photos_to_download.items():
+    # Work out download url
+    mime_type = photo_metadata['mimeType']
+    if mime_type.startswith('image'):
+        url_suffix = '=d'
+    elif mime_type.startswith('video'):
+        url_suffix = '=dv'
+    else:
+        if args.verbose:
+            print("Skipping download of unknown media type {}: {}"
+                  .format(mime_type, filename))
+        continue
+    url = photo_metadata['baseUrl']+url_suffix
+    
+    # Download
+    if args.verbose:
+        print("Downloading {} ({})...".format(filename, mime_type))
+    response = session.get(url, stream=True)
+    
+    # Write to temp file, set dates, rename file to target filename
+    temp_file = tempfile.NamedTemporaryFile(dir=args.cache_dir, delete=False)
+    temp_file_path = Path(temp_file.name)
+    with temp_file:
+        for chunk in response.iter_content(chunk_size=128):
+            temp_file.write(chunk)
+    temp_file.close()
+    response.close()
+    try:
+        file_creation_date = photo_metadata['mediaMetadata']['creationTime']
+        file_creation_date = strptime(file_creation_date, '%Y-%m-%dT%H:%M:%SZ')
+        file_creation_date = int(mktime(file_creation_date))
+        os.utime(temp_file_path, (file_creation_date, file_creation_date))
+    except (OSError, ValueError) as e:
+        if args.verbose:
+            print("Error setting file date on {} ({})\n{}"
+                  .format(temp_file_path, file_creation_date, e))
+    temp_file_path.rename(args.cache_dir / filename)
+        
+# Import to MacOS Photos
+import_photos(args, args.cache_dir)
+        
+        
