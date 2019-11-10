@@ -21,7 +21,6 @@ default_mac_photos_dir = Path.home() / 'Pictures' / 'Photos Library.photoslibrar
 default_batch_size = 5
 
 
-saved_token_file_name = 'access_token.json'
 import_applescript_file_name = 'import_photos.applescript'
 
 
@@ -34,37 +33,60 @@ scopes = ['https://www.googleapis.com/auth/photoslibrary.readonly']
 token = None
 
 ## ############################################################################
-## Helper methods
+## Helper classes
 ## ############################################################################
 
-def load_token():
-    """Load a previously saved access token from filesystem"""
-    global args, token, saved_token_file_name
+class TokenPersister:
+    """Saves and loads tokens to/from the filesystem. Handles user-specific
+    cache directories. This class defines a __call__() so that an instance can
+    be supplied instead of a method expecting a single argument. The load and
+    save methods of this class will also set the "token" global attribute. """
     
-    try:
-        token_file_path = args.cache_dir / saved_token_file_name
-        with token_file_path.open('r') as token_stream:
-            token = json.load(token_stream)
-    except (json.JSONDecodeError):
-        print('Ignoring badly formatted JSON token file:', token_file_path)
-        return None
-    except (FileNotFoundError):
-        print('No saved token file:', token_file_path)
-        return None
-    except (IOError):
-        print('Ignoring inaccessible token file:', token_file_path)
-        return None
-    return token
+    _token_file_path = None
+    
+    def __init__(self, user_cache_dir, token_file_name='access_token.json'):
+        """Creates a new token persister which will save tokens to the given
+        directory."""
+        self._token_file_path = Path(user_cache_dir) / token_file_name
+    
+    def __call__(self, new_token):
+        """Persist the given token to the user-specific cache directory.
+        This method just a pass-through to save_token so that an object
+        of this class can be supplied in lieu of a single-argument method."""
+        self.save_token(token)
+    
+    def save_token(self, new_token):
+        """Persist the given token to the user-specific cache directory."""
+        global token
+        
+        token = new_token
+        with self._token_file_path.open('w') as token_stream:
+            json.dump(new_token, token_stream)
+        self._token_file_path.chmod(0o600)
+    
+    def load_token(self):
+        """Load a previously saved access token from user-specific cache
+        directory in the filesystem. Returns the previously saved token or
+        None if no token was saved or the file is corrupt."""
+        global token
+        
+        try:
+            with self._token_file_path.open('r') as token_stream:
+                token = json.load(token_stream)
+        except (json.JSONDecodeError):
+            print('Ignoring badly formatted JSON token file:', self._token_file_path)
+            return None
+        except (FileNotFoundError):
+            print('No saved token file:', self._token_file_path)
+            return None
+        except (IOError):
+            print('Ignoring inaccessible token file:', self._token_file_path)
+            return None
+        return token
 
-def save_token(new_token):
-    """Persist an access token to the filesystem"""
-    global args, token, saved_token_file_name
-    
-    token = new_token
-    token_file_path = args.cache_dir / saved_token_file_name
-    with token_file_path.open('w') as token_stream:
-        json.dump(new_token, token_stream)
-    token_file_path.chmod(0o600)
+## ############################################################################
+## Helper methods
+## ############################################################################
 
 def request_new_token(client_id,
                       client_secret,
@@ -72,7 +94,8 @@ def request_new_token(client_id,
                       redirect_uri,
                       token_uri, 
                       extra, 
-                      authorization_base_url):
+                      authorization_base_url,
+                      token_persister):
     """Get a completely fresh access token, save it to filesystem and return a
     new session. User will be asked to go to Google and grant permission."""  
     
@@ -80,7 +103,7 @@ def request_new_token(client_id,
                             redirect_uri=redirect_uri,
                             auto_refresh_url=token_uri,
                             auto_refresh_kwargs=extra,
-                            token_updater=save_token)
+                            token_updater=token_persister)
 
     # Direct user to Google for authorization
     authorization_url, _ = session.authorization_url(
@@ -97,7 +120,7 @@ def request_new_token(client_id,
     token = session.fetch_token(token_uri,
                                 client_secret=client_secret,
                                 code=response_code)
-    save_token(token)
+    token_persister(token)
 
     return session
 
@@ -125,7 +148,7 @@ def parse_get_mediaitems_response(response, photos):
 
     return next_page_token
 
-def create_session(args, user_token=None):
+def create_session(args, user_token=None, token_persister=None):
     """Create and returns a requests module session object (with auto-retries
     and auto-token-refresh) either from an existing fresh or stale access token,
     or from scratch (i.e. asking user to authenticate with Google) - if the
@@ -136,12 +159,12 @@ def create_session(args, user_token=None):
                                 token=user_token,
                                 auto_refresh_url=args.token_uri,
                                 auto_refresh_kwargs=args.extra,
-                                token_updater=save_token)
+                                token_updater=token_persister)
     else:
         # Need fresh token - will require user to authenticate with Google
         session = request_new_token(args.client_id, args.client_secret, scopes, 
                                     args.redirect_uri, args.token_uri, args.extra,
-                                    authorization_base_url)
+                                    authorization_base_url, token_persister)
     
     # Either way, configure the session
     retries = Retry(total=args.max_retries,
@@ -341,6 +364,37 @@ def parse_arguments():
     
     return args
     
+def download_file(url, filename, directory, file_creation_timestamp=None, verbose=False):
+    """Downloads a file from the specified URL to the specified destination
+    directory and filename. Optionally sets the timestamp of the new file to the
+    specified value which should be a string of the form "YYYY-MM-DDTHH:MM:SSZ".
+    Verbose output (if specified) is sent to stdout."""
+
+    # Download
+    if verbose:
+        print("Downloading {}...".format(filename))
+    response = session.get(url, stream=True)
+    
+    # Write to temp file, set dates, rename file to target filename
+    temp_file = tempfile.NamedTemporaryFile(dir=directory, delete=False)
+    temp_file_path = Path(temp_file.name)
+    with temp_file:
+        for chunk in response.iter_content(chunk_size=128):
+            temp_file.write(chunk)
+    temp_file.close()
+    response.close()
+    
+    if not file_creation_timestamp == None:
+        try:
+            file_creation_timestamp = strptime(file_creation_timestamp, '%Y-%m-%dT%H:%M:%SZ')
+            file_creation_timestamp = int(mktime(file_creation_timestamp))
+            os.utime(temp_file_path, (file_creation_timestamp, file_creation_timestamp))
+        except (OSError, ValueError) as e:
+            if verbose:
+                print("Error setting file date on {} ({})\n{}"
+                      .format(temp_file_path, file_creation_date, e))
+    temp_file_path.rename(directory / filename)
+        
 ## ############################################################################
 ## Main Routine
 ## ############################################################################
@@ -357,8 +411,9 @@ if args.verbose:
 
 # TODO make multi user
 
-token = load_token()
-session = create_session(args, token)
+token_persister = TokenPersister(default_cache_dir)
+token = token_persister.load_token()
+session = create_session(args, token, token_persister)
 
 # Dict of filename: photo_metadata_dict
 photos = dict()
@@ -405,30 +460,13 @@ for filename, photo_metadata in photos_to_download.items():
         continue
     url = photo_metadata['baseUrl']+url_suffix
     
-    # Download
-    if args.verbose:
-        print("Downloading {} ({})...".format(filename, mime_type))
-    response = session.get(url, stream=True)
-    
-    # Write to temp file, set dates, rename file to target filename
-    temp_file = tempfile.NamedTemporaryFile(dir=args.cache_dir, delete=False)
-    temp_file_path = Path(temp_file.name)
-    with temp_file:
-        for chunk in response.iter_content(chunk_size=128):
-            temp_file.write(chunk)
-    temp_file.close()
-    response.close()
     try:
         file_creation_date = photo_metadata['mediaMetadata']['creationTime']
-        file_creation_date = strptime(file_creation_date, '%Y-%m-%dT%H:%M:%SZ')
-        file_creation_date = int(mktime(file_creation_date))
-        os.utime(temp_file_path, (file_creation_date, file_creation_date))
-    except (OSError, ValueError) as e:
-        if args.verbose:
-            print("Error setting file date on {} ({})\n{}"
-                  .format(temp_file_path, file_creation_date, e))
-    temp_file_path.rename(args.cache_dir / filename)
-        
+    except:
+        file_creation_date = None
+    
+    download_file(url, filename, args.cache_dir, file_creation_date, args.verbose)
+
 # Import to MacOS Photos
 import_photos(args, args.cache_dir)
         
