@@ -20,6 +20,8 @@ default_max_retries_per_request = 3
 default_mac_photos_dir = Path.home() / 'Pictures' / 'Photos Library.photoslibrary'
 default_batch_size = 5
 
+# TODO make args global eberywhere for simplicity
+args = None
 
 import_applescript_file_name = 'import_photos.applescript'
 
@@ -283,6 +285,21 @@ def parse_arguments():
     .format(default_mac_photos_dir), default=default_mac_photos_dir, 
     type=Path)
     
+    parser.add_argument('-a', '--add-user', help="""Add a google user account
+    to sync. Note that the NICKNAME is **not** the Google username, it merely
+    distinguishes multiple Google syncs on this machine. The NICKNAME will never
+    be passed to Google and Google usernames/passwords will never be stored on
+    or accessed by this program. The user will be directed to Google to enter
+    username and password to suthenticate this program to access the users
+    photos.""", nargs='+', metavar='NICKNAME', dest='users')
+
+    parser.add_argument('-z', '--remove-user', help="""Removes a google user
+    account from the cached accounts to sync. NICKNAME is the same value that
+    was passed to the -a/--add-user option. Removing and adding the same
+    NICKNAME will clear stored credentials and previously downloaded photos for
+    that user.""", nargs='+', metavar='NICKNAME',
+    dest='users_to_remove')
+
     args = parser.parse_args()
     
     if not args.mac_photos_library.is_dir():
@@ -293,6 +310,28 @@ def parse_arguments():
     if not args.cache_dir.is_dir():
         args.cache_dir.mkdir(exist_ok=True)
     
+    # Remove cache-dirs for specified users
+    if not args.users_to_remove == None:
+        for nickname in args.users_to_remove:
+            user_cache_dir = args.cache_dir / nickname
+            if user_cache_dir.is_dir():
+                shutil.rmtree(user_cache_dir)
+                if args.verbose:
+                    print("Deleted user-cache for {}".format(nickname))
+            elif user_cache_dir.is_file():
+                user_cache_dir.unlink()
+                if args.verbose:
+                    print("Deleted user-cache for {}".format(nickname))
+
+    # Add empty cache-dirs for new users - will prompt later for Google
+    # authentication
+    if not args.users == None:
+        for nickname in args.users:
+            user_cache_dir = args.cache_dir / nickname
+            if not user_cache_dir.exists():
+                user_cache_dir.mkdir()
+    
+    # Read/Store credentials file and read info from it
     cached_credentials_file_path = args.cache_dir / default_credentials_file_name
     if args.credentials_file == None:
         # Use cached credentials file
@@ -394,7 +433,12 @@ def download_file(url, filename, directory, file_creation_timestamp=None, verbos
                 print("Error setting file date on {} ({})\n{}"
                       .format(temp_file_path, file_creation_date, e))
     temp_file_path.rename(directory / filename)
-        
+
+def get_user_cache_dir(nickname):
+    global args
+    # TODO
+    pass
+
 ## ############################################################################
 ## Main Routine
 ## ############################################################################
@@ -410,6 +454,8 @@ if args.verbose:
     print (len(photo_files_on_disk),'files found in Photos library on disk')
 
 # TODO make multi user
+#
+# for nickname in args.users:
 
 token_persister = TokenPersister(default_cache_dir)
 token = token_persister.load_token()
