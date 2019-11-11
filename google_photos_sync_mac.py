@@ -12,27 +12,23 @@ import tempfile
 from time import strptime, mktime
 
 ## ############################################################################
-## Global config
+## Default config - can be overridden by command line arguments
 ## ############################################################################
 default_cache_dir = Path.home() / '.google-photos-sync-mac'
 default_credentials_file_name = 'credentials.json'
 default_max_retries_per_request = 3
 default_mac_photos_dir = Path.home() / 'Pictures' / 'Photos Library.photoslibrary'
-default_batch_size = 5
+default_batch_size = 15
 
-# TODO make args global eberywhere for simplicity
-args = None
-
+## ############################################################################
+## Global config
+## ############################################################################
 import_applescript_file_name = 'import_photos.applescript'
-
+users_cache_dir_name = 'users'
+users_photos_dir_name = 'photos'
 
 authorization_base_url = "https://accounts.google.com/o/oauth2/v2/auth"
 scopes = ['https://www.googleapis.com/auth/photoslibrary.readonly']
-
-# A cache of the contents of saved_token_file_name. This is "global'd" by load_token
-# and save_token so that if the token is auto-refreshed by requests_oauthlib
-# then the refreshed value is immediately available to all
-token = None
 
 ## ############################################################################
 ## Helper classes
@@ -45,6 +41,7 @@ class TokenPersister:
     save methods of this class will also set the "token" global attribute. """
     
     _token_file_path = None
+    _token = None
     
     def __init__(self, user_cache_dir, token_file_name='access_token.json'):
         """Creates a new token persister which will save tokens to the given
@@ -55,13 +52,12 @@ class TokenPersister:
         """Persist the given token to the user-specific cache directory.
         This method just a pass-through to save_token so that an object
         of this class can be supplied in lieu of a single-argument method."""
-        self.save_token(token)
+        self.save_token(new_token)
     
     def save_token(self, new_token):
         """Persist the given token to the user-specific cache directory."""
-        global token
         
-        token = new_token
+        self._token = new_token
         with self._token_file_path.open('w') as token_stream:
             json.dump(new_token, token_stream)
         self._token_file_path.chmod(0o600)
@@ -70,21 +66,21 @@ class TokenPersister:
         """Load a previously saved access token from user-specific cache
         directory in the filesystem. Returns the previously saved token or
         None if no token was saved or the file is corrupt."""
-        global token
-        
-        try:
-            with self._token_file_path.open('r') as token_stream:
-                token = json.load(token_stream)
-        except (json.JSONDecodeError):
-            print('Ignoring badly formatted JSON token file:', self._token_file_path)
-            return None
-        except (FileNotFoundError):
-            print('No saved token file:', self._token_file_path)
-            return None
-        except (IOError):
-            print('Ignoring inaccessible token file:', self._token_file_path)
-            return None
-        return token
+
+        if self._token == None:
+            try:
+                with self._token_file_path.open('r') as token_stream:
+                    self._token = json.load(token_stream)
+            except (json.JSONDecodeError):
+                print('Ignoring badly formatted JSON token file:', self._token_file_path)
+                return None
+            except (FileNotFoundError):
+                print('No saved token file:', self._token_file_path)
+                return None
+            except (IOError):
+                print('Ignoring inaccessible token file:', self._token_file_path)
+                return None
+        return self._token
 
 ## ############################################################################
 ## Helper methods
@@ -119,10 +115,10 @@ def request_new_token(client_id,
     response_code = input('Paste Google\'s response code here: ')
 
     # Fetch the access token
-    token = session.fetch_token(token_uri,
+    new_token = session.fetch_token(token_uri,
                                 client_secret=client_secret,
                                 code=response_code)
-    token_persister(token)
+    token_persister.save_token(new_token)
 
     return session
 
@@ -185,10 +181,11 @@ def create_session(args, user_token=None, token_persister=None):
     
     return session
    
-def import_photos(args, directory):
+def import_photos(photos_directory_to_import, top_level_cache_dir):
     
-    directory = Path(directory).resolve()
-    alias = "Macintosh HD"+str(directory).replace('/', ':')
+    top_level_cache_dir = Path(top_level_cache_dir).resolve()
+    photos_directory_to_import = Path(photos_directory_to_import).resolve()
+    alias = "Macintosh HD"+photos_directory_to_import.name.replace('/', ':')
     
     # Double braces to escape
     import_applescript = """-- generated file - do not edit
@@ -211,10 +208,11 @@ end tell
     
 """.format(alias)
 
-    applescript_file_path = Path(args.cache_dir) / import_applescript_file_name
+    applescript_file_path = top_level_cache_dir / import_applescript_file_name
     with applescript_file_path.open('w') as stream:
         stream.write(import_applescript)
     
+    # TODO handle the return value - need to wait on it?
     applescript.run(applescript_file_path, background=False)
    
     
@@ -285,13 +283,18 @@ def parse_arguments():
     .format(default_mac_photos_dir), default=default_mac_photos_dir, 
     type=Path)
     
+    parser.add_argument('-k', '--keep-downloads', help="""Do not delete the
+    photos downloaded from Google after importing into the MacOS Photos library.
+    However, the photos will be deleted the next time this program is run.""",
+    action='store_true')
+    
     parser.add_argument('-a', '--add-user', help="""Add a google user account
     to sync. Note that the NICKNAME is **not** the Google username, it merely
     distinguishes multiple Google syncs on this machine. The NICKNAME will never
     be passed to Google and Google usernames/passwords will never be stored on
     or accessed by this program. The user will be directed to Google to enter
     username and password to suthenticate this program to access the users
-    photos.""", nargs='+', metavar='NICKNAME', dest='users')
+    photos.""", nargs='+', metavar='NICKNAME', dest='users_to_add')
 
     parser.add_argument('-z', '--remove-user', help="""Removes a google user
     account from the cached accounts to sync. NICKNAME is the same value that
@@ -313,23 +316,23 @@ def parse_arguments():
     # Remove cache-dirs for specified users
     if not args.users_to_remove == None:
         for nickname in args.users_to_remove:
-            user_cache_dir = args.cache_dir / nickname
+            user_cache_dir = get_user_cache_dir(args, nickname)
             if user_cache_dir.is_dir():
                 shutil.rmtree(user_cache_dir)
                 if args.verbose:
-                    print("Deleted user-cache for {}".format(nickname))
+                    print("Deleted user-cache directory for {}".format(nickname))
             elif user_cache_dir.is_file():
                 user_cache_dir.unlink()
                 if args.verbose:
-                    print("Deleted user-cache for {}".format(nickname))
+                    print("Deleted user-cache file(!?) for {}".format(nickname))
 
     # Add empty cache-dirs for new users - will prompt later for Google
     # authentication
-    if not args.users == None:
+    if not args.users_to_add == None:
         for nickname in args.users:
-            user_cache_dir = args.cache_dir / nickname
+            user_cache_dir = get_user_cache_dir(args, nickname)
             if not user_cache_dir.exists():
-                user_cache_dir.mkdir()
+                user_cache_dir.mkdir(parents=True)
     
     # Read/Store credentials file and read info from it
     cached_credentials_file_path = args.cache_dir / default_credentials_file_name
@@ -434,11 +437,20 @@ def download_file(url, filename, directory, file_creation_timestamp=None, verbos
                       .format(temp_file_path, file_creation_date, e))
     temp_file_path.rename(directory / filename)
 
-def get_user_cache_dir(nickname):
-    global args
-    # TODO
-    pass
+def get_user_cache_dir(args, nickname):
+    """Returns the path to the cache directory for the given user."""
+    return args.cache_dir / users_cache_dir_name / nickname
 
+def get_users(args):
+    """Returns a lisr of the nicknames of pre-cached users. Inspects the 
+    users_cache_dir_name directory for subdirectories - each is a user cache."""
+    users_directory = args.cache_dir / users_cache_dir_name
+    users = []
+    for child in users_directory.iterdir():
+        if child.is_dir():
+            users.append(child.name)
+    return users
+    
 ## ############################################################################
 ## Main Routine
 ## ############################################################################
@@ -453,67 +465,76 @@ for (dirpath, dirnames, filenames) in os.walk(args.mac_photos_library):
 if args.verbose:
     print (len(photo_files_on_disk),'files found in Photos library on disk')
 
-# TODO make multi user
-#
-# for nickname in args.users:
 
-token_persister = TokenPersister(default_cache_dir)
-token = token_persister.load_token()
-session = create_session(args, token, token_persister)
-
-# Dict of filename: photo_metadata_dict
-photos = dict()
-
-# Get the first batch of photos-metadata and populate photos dict
-response = session.get('https://photoslibrary.googleapis.com/v1/mediaItems',
-                       headers={'Authorization': 'Bearer '+token['access_token']})
-next_page_token = parse_get_mediaitems_response(response, photos)
-
-# TODO uncomment:
-
-# Repeat whilst Google returns a token indicating more items to come
-#while next_page_token != None:
-#    if args.verbose:
-#        print('Got',len(photos),'. Fetching next page with token',next_page_token,'...')
-#    response = session.get('https://photoslibrary.googleapis.com/v1/mediaItems',
-#                       headers={'Authorization': 'Bearer '+token['access_token']},
-#                       params={'pageToken': next_page_token})
-#    next_page_token = parse_get_mediaitems_response(response, photos)
-if args.verbose:
-    print (len(photos),'photos found in Google Photos online')
+for nickname in get_users(args):
     
-# Compare filenames from Google and filesystem.
-# Create dict of filename: photo_metadata_dict
-photos_to_download = dict()
-for filename in photos:
-    if filename not in photo_files_on_disk:
-        photos_to_download[filename] = photos[filename]
-if args.verbose:
-    print(len(photos_to_download),'photos need to be downloaded from Google')
-
-# Download each photo from Google
-for filename, photo_metadata in photos_to_download.items():
-    # Work out download url
-    mime_type = photo_metadata['mimeType']
-    if mime_type.startswith('image'):
-        url_suffix = '=d'
-    elif mime_type.startswith('video'):
-        url_suffix = '=dv'
-    else:
-        if args.verbose:
-            print("Skipping download of unknown media type {}: {}"
-                  .format(mime_type, filename))
-        continue
-    url = photo_metadata['baseUrl']+url_suffix
+    user_cache_dir = get_user_cache_dir(args, nickname)
+    user_photos_dir = user_cache_dir / users_photos_dir_name
     
-    try:
-        file_creation_date = photo_metadata['mediaMetadata']['creationTime']
-    except:
-        file_creation_date = None
-    
-    download_file(url, filename, args.cache_dir, file_creation_date, args.verbose)
+    # empty the user's photos cache dir
+    if user_photos_dir.exists():
+        shutil.rmtree(user_photos_dir)
+    user_photos_dir.mkdir()
 
-# Import to MacOS Photos
-import_photos(args, args.cache_dir)
+    token_persister = TokenPersister(user_cache_dir)
+    token = token_persister.load_token()
+    session = create_session(args, token, token_persister)
+    
+    # Dict of filename: photo_metadata_dict
+    photos = dict()
+    
+    # Get the first batch of photos-metadata and populate photos dict
+    response = session.get('https://photoslibrary.googleapis.com/v1/mediaItems',
+                           headers={'Authorization': 'Bearer '+token['access_token']})
+    next_page_token = parse_get_mediaitems_response(response, photos)
+    
+    # TODO uncomment:
+    
+    # Repeat whilst Google returns a token indicating more items to come
+    #while next_page_token != None:
+    #    if args.verbose:
+    #        print('Got',len(photos),'. Fetching next page with token',next_page_token,'...')
+    #    response = session.get('https://photoslibrary.googleapis.com/v1/mediaItems',
+    #                       headers={'Authorization': 'Bearer '+token['access_token']},
+    #                       params={'pageToken': next_page_token})
+    #    next_page_token = parse_get_mediaitems_response(response, photos)
+    if args.verbose:
+        print (len(photos),'photos found in Google Photos online')
+        
+    # Compare filenames from Google and filesystem.
+    # Create dict of filename: photo_metadata_dict
+    photos_to_download = dict()
+    for filename in photos:
+        if filename not in photo_files_on_disk:
+            photos_to_download[filename] = photos[filename]
+    if args.verbose:
+        print(len(photos_to_download),'photos need to be downloaded from Google')
+    
+    # Download each photo from Google
+    for filename, photo_metadata in photos_to_download.items():
+        # Work out download url
+        mime_type = photo_metadata['mimeType']
+        if mime_type.startswith('image'):
+            url_suffix = '=d'
+        elif mime_type.startswith('video'):
+            url_suffix = '=dv'
+        else:
+            if args.verbose:
+                print("Skipping download of unknown media type {}: {}"
+                      .format(mime_type, filename))
+            continue
+        url = photo_metadata['baseUrl']+url_suffix
+        
+        try:
+            file_creation_date = photo_metadata['mediaMetadata']['creationTime']
+        except:
+            file_creation_date = None
+        
+        download_file(url, filename, user_photos_dir, file_creation_date, args.verbose)
+    
+    # Import to MacOS Photos
+    import_photos(user_photos_dir, args.cache_dir)
+    if not args.keep_downloads:
+        shutil.rmtree(user_photos_dir)
         
         
