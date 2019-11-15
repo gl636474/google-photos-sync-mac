@@ -18,7 +18,7 @@ default_cache_dir = Path.home() / '.google-photos-sync-mac'
 default_credentials_file_name = 'credentials.json'
 default_max_retries_per_request = 3
 default_mac_photos_dir = Path.home() / 'Pictures' / 'Photos Library.photoslibrary'
-default_batch_size = 25
+default_fetch_size = 50
 
 ## ############################################################################
 ## Global config
@@ -73,11 +73,19 @@ def main():
         token_persister = TokenPersister(user_cache_dir)
         token = token_persister.load_token()
         session = create_session(args, token, token_persister)
+
+        if session == None:
+            if args.verbose:
+                print("Skipping user {} - no Google acces token. Run interactively (without --batch-mode)."
+                      .format(nickname))
+            continue
         
         # Dict of filename: photo_metadata_dict
         photos = dict()
         
         # Get the first batch of photos-metadata and populate photos dict
+        if args.verbose:
+            print("Fetching list of photos from Google...")
         response = session.get('https://photoslibrary.googleapis.com/v1/mediaItems',
                                headers={'Authorization': 'Bearer '+token['access_token']})
         next_page_token = parse_get_mediaitems_response(response, photos)
@@ -86,8 +94,12 @@ def main():
         
         # Repeat whilst Google returns a token indicating more items to come
         while next_page_token != None:
-            if args.verbose:
-                print('Got',len(photos),'. Fetching next page with token',next_page_token,'...')
+            if args.verbose >= 3:
+                print('Got {} photos. Fetching next page with token "..{}".'
+                      .format(len(photos), next_page_token[-27:]))
+            elif args.verbose >= 2:
+                print('Got {} photos.'.format(len(photos)))
+                
             response = session.get('https://photoslibrary.googleapis.com/v1/mediaItems',
                                headers={'Authorization': 'Bearer '+token['access_token']},
                                params={'pageToken': next_page_token})
@@ -197,6 +209,11 @@ class TokenPersister:
 ## Helper methods
 ## ############################################################################
 
+def error_print(message, code=1):
+    """Prints the message to stderr and exits with the specified code."""
+    print(message, file=sys.stderr)
+    exit(code)
+
 def request_new_token(client_id,
                       client_secret,
                       scopes,
@@ -258,7 +275,7 @@ def parse_get_mediaitems_response(response, photos):
     return next_page_token
 
 def create_session(args, user_token=None, token_persister=None):
-    """Create and returns a requests module session object (with auto-retries
+    """Create and returns a requests.Session object (with auto-retries
     and auto-token-refresh) either from an existing fresh or stale access token,
     or from scratch (i.e. asking user to authenticate with Google) - if the
     user_token argument is None."""
@@ -269,11 +286,13 @@ def create_session(args, user_token=None, token_persister=None):
                                 auto_refresh_url=args.token_uri,
                                 auto_refresh_kwargs=args.extra,
                                 token_updater=token_persister)
-    else:
+    elif not args.batch_mode:
         # Need fresh token - will require user to authenticate with Google
         session = request_new_token(args.client_id, args.client_secret, scopes, 
                                     args.redirect_uri, args.token_uri, args.extra,
                                     authorization_base_url, token_persister)
+    else:
+        return None
     
     # Either way, configure the session
     retries = Retry(total=args.max_retries,
@@ -285,7 +304,7 @@ def create_session(args, user_token=None, token_persister=None):
     
     # GET mediaItems needs Content-type header and pageSize param on every call
     session.headers.update({'Content-type': 'application/json'})
-    session.params.update({'pageSize': args.batch_size})
+    session.params.update({'pageSize': args.fetch_size})
 
     # Authorization header will change on token refresh so it must be added
     # separately on each request
@@ -352,6 +371,12 @@ def parse_arguments():
     acounts are scanned, photos with the same filename as an already
     downloaded photo will be skipped.""")
     
+    parser.add_argument('-b', '--batch-mode', help="""Do not prompt user to
+    authenticate with Google if there is no cached access token; in which case
+    that user is ignored. Also do not prompt user if there are no Google client
+    credentials cached or supplied on the command line; in which case the
+    program will just terminate.""", action='store_true')
+    
     parser.add_argument('-d', '--cache-dir', help="""Use this directory to cache
     Google application credentials file, Google user authentication tokens
     and downloaded photos (before they are imported into the MacOS Photos
@@ -390,9 +415,9 @@ def parse_arguments():
     value specified in the cached credentials file or in the file specified
     with the --credentials option.""", metavar='STRING')
     
-    parser.add_argument('-b', '--batch-size', help="""When retrieving the list
+    parser.add_argument('-f', '--fetch-size', help="""When retrieving the list
     of photos from Google, retrieve in batches of this size. Defaults to {}"""
-    .format(default_batch_size), default=default_batch_size, type=int)
+    .format(default_fetch_size), default=default_fetch_size, type=int)
     
     parser.add_argument('-m', '--max-retries', help="""Maximum number of retries
     for each individual GET request to Google. Defaults to {}."""
@@ -400,7 +425,8 @@ def parse_arguments():
     default=default_max_retries_per_request)
     
     parser.add_argument('-v', '--verbose', help="""Output progress updates.
-    Without this option only errors are outputted.""", action='store_true')
+    Without this option only errors are outputted. Specify two or three times
+    for even more verbose output.""", action='count')
     
     parser.add_argument('-l', '--mac-photos-library', help="""The Photos Library
     or top level directory to scan for existing photos. Defaults to {}."""
@@ -430,9 +456,7 @@ def parse_arguments():
     args = parser.parse_args()
     
     if not args.mac_photos_library.is_dir():
-        print('{} is not a directory or Photos Library'
-              .format(args.mac_photos_library), file=sys.stderr)
-        exit(1)
+        error_print('{} is not a directory or Photos Library'.format(args.mac_photos_library))
     
     if not args.cache_dir.is_dir():
         args.cache_dir.mkdir(exist_ok=True)
@@ -465,19 +489,17 @@ def parse_arguments():
         try:
             args.credentials_file = cached_credentials_file_path.open('r')
         except FileNotFoundError as e:
-            print('Cannot open file {}'.format(e.filename), file=sys.stderr)
-            exit(1)
+            error_print("No cached credentials file ({}) and no --credentials option specified"
+                  .format(e.filename))
     else:
         # Using specified credentials file, cache it for subsequent use
         try:
             shutil.copyfile(args.credentials_file.name, cached_credentials_file_path)
         except shutil.SameFileError:
-            print("Cancelled copying specified credentials file: same file",
-                  file=sys.stderr)
+            error_print("Cancelled copying specified credentials file: same file")
         except IOError as e:
-            print("Failed to copy credentials file {} to cache ({})\n{}"
+            error_print("Failed to copy credentials file {} to cache ({})\n{}"
                   .format(args.credentials_file.name, cached_credentials_file_path, e))
-            exit(1)
 
     try:
         # Create dict of info contained in credentials file
@@ -512,21 +534,16 @@ def parse_arguments():
         }
         
     except json.JSONDecodeError:
-        print('Invalid JSON file: {}'.format(args.credentials_file.name),
-              file=sys.stderr)
-        exit(1)
+        error_print('Invalid JSON file: {}'.format(args.credentials_file.name))
     except KeyError as e:
-        print("Missing JSON property '{}' in credentials file {}"
-              .format(e, args.credentials_file.name), file=sys.stderr)
-        exit(1)
-    except IndexError:
-        print("Missing (one or more) redirect URIs in credentials file {}"
-              .format(args.credentials_file.name), file=sys.stderr)
-        exit(1)
+        error_print("Missing JSON property '{}' in credentials file {} (and not supplied on command line"
+                    .format(e, args.credentials_file.name))
+    except IndexError as e:
+        error_print("Missing (one or more) redirect URIs in credentials file {}"
+                    .format(args.credentials_file.name))
     except IOError as e:
-        print('Cannot read from file: {}\n{}'
-              .format(args.credentials_file.name, e), file=sys.stderr)
-        exit(1)
+        error_print('Cannot read from file: {}\n{}'
+                    .format(args.credentials_file.name, e))
     
     return args
     
