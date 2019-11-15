@@ -9,7 +9,7 @@ import os
 import shutil
 import sys
 import tempfile
-from time import strptime, mktime
+from time import strptime, mktime, sleep
 
 ## ############################################################################
 ## Default config - can be overridden by command line arguments
@@ -18,7 +18,7 @@ default_cache_dir = Path.home() / '.google-photos-sync-mac'
 default_credentials_file_name = 'credentials.json'
 default_max_retries_per_request = 3
 default_mac_photos_dir = Path.home() / 'Pictures' / 'Photos Library.photoslibrary'
-default_batch_size = 15
+default_batch_size = 25
 
 ## ############################################################################
 ## Global config
@@ -29,6 +29,117 @@ users_photos_dir_name = 'photos'
 
 authorization_base_url = "https://accounts.google.com/o/oauth2/v2/auth"
 scopes = ['https://www.googleapis.com/auth/photoslibrary.readonly']
+
+## ############################################################################
+## Main Routine
+## ############################################################################
+
+def main():
+    """Performs the following steps:
+       * Find photo files in the specified Photos library
+       * For each cached user:
+          * Refresh existing access token or direct user to Google page for
+            authorisation and store the new access token
+          * Get list of all photo filenames from Google
+          * Determine missing photos
+          * Download the missing photos
+          * Implort into Photos library
+       * Tidy up cache dirs and wait for any still running sub-processes"""
+    args = parse_arguments()
+    
+    # Inspect filesystem for photo files. Create dict filename: full_file_path
+    photo_files_on_disk = dict()
+    for (dirpath, _, filenames) in os.walk(args.mac_photos_library):
+        for filename in filenames:
+            photo_files_on_disk[filename] = os.path.join(dirpath, filename)
+    if args.verbose:
+        print (len(photo_files_on_disk),'files found in Photos library on disk')
+    
+    # The import applescripts run in the background, this list keeps track of
+    # the running processes so this script (and therefore child processes) does
+    # not terminate before they have finished.
+    import_processes = []
+    
+    for nickname in get_users(args):
+        
+        user_cache_dir = get_user_cache_dir(args, nickname)
+        user_photos_dir = user_cache_dir / users_photos_dir_name
+        
+        # empty the user's photos cache dir
+        if user_photos_dir.exists():
+            shutil.rmtree(user_photos_dir)
+        user_photos_dir.mkdir()
+    
+        token_persister = TokenPersister(user_cache_dir)
+        token = token_persister.load_token()
+        session = create_session(args, token, token_persister)
+        
+        # Dict of filename: photo_metadata_dict
+        photos = dict()
+        
+        # Get the first batch of photos-metadata and populate photos dict
+        response = session.get('https://photoslibrary.googleapis.com/v1/mediaItems',
+                               headers={'Authorization': 'Bearer '+token['access_token']})
+        next_page_token = parse_get_mediaitems_response(response, photos)
+        
+        # TODO: uncomment:
+        
+        # Repeat whilst Google returns a token indicating more items to come
+        while next_page_token != None:
+            if args.verbose:
+                print('Got',len(photos),'. Fetching next page with token',next_page_token,'...')
+            response = session.get('https://photoslibrary.googleapis.com/v1/mediaItems',
+                               headers={'Authorization': 'Bearer '+token['access_token']},
+                               params={'pageToken': next_page_token})
+            next_page_token = parse_get_mediaitems_response(response, photos)
+        if args.verbose:
+            print (len(photos),'photos found in Google Photos online')
+            
+        # Compare filenames from Google and filesystem.
+        # Create dict of filename: photo_metadata_dict
+        photos_to_download = dict()
+        for filename in photos:
+            if filename not in photo_files_on_disk:
+                photos_to_download[filename] = photos[filename]
+        if args.verbose:
+            print(len(photos_to_download),'photos need to be downloaded from Google')
+        
+        # Download each photo from Google
+        for filename, photo_metadata in photos_to_download.items():
+            # Work out download url
+            mime_type = photo_metadata['mimeType']
+            if mime_type.startswith('image'):
+                url_suffix = '=d'
+            elif mime_type.startswith('video'):
+                url_suffix = '=dv'
+            else:
+                if args.verbose:
+                    print("Skipping download of unknown media type {}: {}"
+                          .format(mime_type, filename))
+                continue
+            url = photo_metadata['baseUrl']+url_suffix
+            
+            try:
+                file_creation_date = photo_metadata['mediaMetadata']['creationTime']
+            except:
+                file_creation_date = None
+            
+            download_file(session, url, filename, user_photos_dir, file_creation_date, args.verbose)
+        
+        # Import to MacOS Photos - asynchronously
+        process = import_photos(user_photos_dir, args.mac_photos_library, args.cache_dir)
+        import_processes.append(process)
+    
+    while not all(not process.running for process in import_processes):
+        if args.verbose:
+            print("Waiting for import processes to finish...")
+            sleep(5)
+    
+    if not args.keep_downloads:
+        for nickname in get_users(args):
+            user_cache_dir = get_user_cache_dir(args, nickname)
+            user_photos_dir = user_cache_dir / users_photos_dir_name
+            shutil.rmtree(user_photos_dir)
 
 ## ############################################################################
 ## Helper classes
@@ -181,11 +292,23 @@ def create_session(args, user_token=None, token_persister=None):
     
     return session
    
-def import_photos(photos_directory_to_import, top_level_cache_dir):
+def import_photos(photos_directory_to_import, photos_library, temp_cache_dir=tempfile.gettempdir()):
+    """Imports the photos in photos_dirctory_to_import into the specified MacOS
+    Photos library. This method needs a temporary directory in which to store
+    and run an applescript file. This tempory directory can be explicitly
+    specified by temp_cache_dir, if not supplied the system default temp
+    directory will be used.""" 
     
-    top_level_cache_dir = Path(top_level_cache_dir).resolve()
-    photos_directory_to_import = Path(photos_directory_to_import).resolve()
-    alias = "Macintosh HD"+photos_directory_to_import.name.replace('/', ':')
+    temp_cache_dir = Path(temp_cache_dir).resolve()
+    
+    # TODO: needs to be ful path
+    import_library_alias = Path(photos_library).resolve()
+    import_library_alias = "Macintosh HD" + str(import_library_alias)
+    import_library_alias = import_library_alias.replace('/', ':')
+    
+    import_folder_alias = Path(photos_directory_to_import).resolve()
+    import_folder_alias = "Macintosh HD" + str(import_folder_alias)
+    import_folder_alias = import_folder_alias.replace('/', ':')
     
     # Double braces to escape
     import_applescript = """-- generated file - do not edit
@@ -203,17 +326,18 @@ end repeat
 tell application "Photos"
     activate
     delay 2
+    open "{}"
+    delay 2
     import imageList
 end tell
     
-""".format(alias)
+""".format(import_folder_alias, import_library_alias)
 
-    applescript_file_path = top_level_cache_dir / import_applescript_file_name
+    applescript_file_path = temp_cache_dir / import_applescript_file_name
     with applescript_file_path.open('w') as stream:
         stream.write(import_applescript)
     
-    # TODO handle the return value - need to wait on it?
-    applescript.run(applescript_file_path, background=False)
+    return applescript.run(applescript_file_path, background=False)
    
     
 def parse_arguments():
@@ -406,7 +530,7 @@ def parse_arguments():
     
     return args
     
-def download_file(url, filename, directory, file_creation_timestamp=None, verbose=False):
+def download_file(session, url, filename, directory, file_creation_timestamp=None, verbose=False):
     """Downloads a file from the specified URL to the specified destination
     directory and filename. Optionally sets the timestamp of the new file to the
     specified value which should be a string of the form "YYYY-MM-DDTHH:MM:SSZ".
@@ -428,13 +552,13 @@ def download_file(url, filename, directory, file_creation_timestamp=None, verbos
     
     if not file_creation_timestamp == None:
         try:
-            file_creation_timestamp = strptime(file_creation_timestamp, '%Y-%m-%dT%H:%M:%SZ')
-            file_creation_timestamp = int(mktime(file_creation_timestamp))
-            os.utime(temp_file_path, (file_creation_timestamp, file_creation_timestamp))
+            file_creation_time_struct = strptime(file_creation_timestamp, '%Y-%m-%dT%H:%M:%SZ')
+            file_creation_secs = int(mktime(file_creation_time_struct))
+            os.utime(temp_file_path, (file_creation_secs, file_creation_secs))
         except (OSError, ValueError) as e:
             if verbose:
                 print("Error setting file date on {} ({})\n{}"
-                      .format(temp_file_path, file_creation_date, e))
+                      .format(temp_file_path, file_creation_timestamp, e))
     temp_file_path.rename(directory / filename)
 
 def get_user_cache_dir(args, nickname):
@@ -452,89 +576,9 @@ def get_users(args):
     return users
     
 ## ############################################################################
-## Main Routine
+## Execution starts here
 ## ############################################################################
 
-args = parse_arguments()
-
-# Inspect filesystem for photo files. Create dict of filename: full_file_path
-photo_files_on_disk = dict()
-for (dirpath, dirnames, filenames) in os.walk(args.mac_photos_library):
-    for filename in filenames:
-        photo_files_on_disk[filename] = os.path.join(dirpath, filename)
-if args.verbose:
-    print (len(photo_files_on_disk),'files found in Photos library on disk')
-
-
-for nickname in get_users(args):
-    
-    user_cache_dir = get_user_cache_dir(args, nickname)
-    user_photos_dir = user_cache_dir / users_photos_dir_name
-    
-    # empty the user's photos cache dir
-    if user_photos_dir.exists():
-        shutil.rmtree(user_photos_dir)
-    user_photos_dir.mkdir()
-
-    token_persister = TokenPersister(user_cache_dir)
-    token = token_persister.load_token()
-    session = create_session(args, token, token_persister)
-    
-    # Dict of filename: photo_metadata_dict
-    photos = dict()
-    
-    # Get the first batch of photos-metadata and populate photos dict
-    response = session.get('https://photoslibrary.googleapis.com/v1/mediaItems',
-                           headers={'Authorization': 'Bearer '+token['access_token']})
-    next_page_token = parse_get_mediaitems_response(response, photos)
-    
-    # TODO uncomment:
-    
-    # Repeat whilst Google returns a token indicating more items to come
-    #while next_page_token != None:
-    #    if args.verbose:
-    #        print('Got',len(photos),'. Fetching next page with token',next_page_token,'...')
-    #    response = session.get('https://photoslibrary.googleapis.com/v1/mediaItems',
-    #                       headers={'Authorization': 'Bearer '+token['access_token']},
-    #                       params={'pageToken': next_page_token})
-    #    next_page_token = parse_get_mediaitems_response(response, photos)
-    if args.verbose:
-        print (len(photos),'photos found in Google Photos online')
-        
-    # Compare filenames from Google and filesystem.
-    # Create dict of filename: photo_metadata_dict
-    photos_to_download = dict()
-    for filename in photos:
-        if filename not in photo_files_on_disk:
-            photos_to_download[filename] = photos[filename]
-    if args.verbose:
-        print(len(photos_to_download),'photos need to be downloaded from Google')
-    
-    # Download each photo from Google
-    for filename, photo_metadata in photos_to_download.items():
-        # Work out download url
-        mime_type = photo_metadata['mimeType']
-        if mime_type.startswith('image'):
-            url_suffix = '=d'
-        elif mime_type.startswith('video'):
-            url_suffix = '=dv'
-        else:
-            if args.verbose:
-                print("Skipping download of unknown media type {}: {}"
-                      .format(mime_type, filename))
-            continue
-        url = photo_metadata['baseUrl']+url_suffix
-        
-        try:
-            file_creation_date = photo_metadata['mediaMetadata']['creationTime']
-        except:
-            file_creation_date = None
-        
-        download_file(url, filename, user_photos_dir, file_creation_date, args.verbose)
-    
-    # Import to MacOS Photos
-    import_photos(user_photos_dir, args.cache_dir)
-    if not args.keep_downloads:
-        shutil.rmtree(user_photos_dir)
-        
+if __name__ == "__main__":
+    main()        
         
