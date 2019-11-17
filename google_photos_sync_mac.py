@@ -159,14 +159,13 @@ class TokenPersister:
     """Saves and loads tokens to/from the filesystem. Handles user-specific
     cache directories. This class defines a __call__() so that an instance can
     be supplied instead of a method expecting a single argument."""
-    
-    _token_file_path = None
-    _token = None
+
     
     def __init__(self, user_cache_dir, token_file_name='access_token.json'):
         """Creates a new token persister which will save tokens to the given
         directory."""
         self._token_file_path = Path(user_cache_dir) / token_file_name
+        self._token = None
     
     def __call__(self, new_token):
         """Persist the given token to the user-specific cache directory.
