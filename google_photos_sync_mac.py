@@ -140,7 +140,7 @@ def main():
         process = import_photos(user_photos_dir, args.mac_photos_library, args.cache_dir)
         import_processes.append(process)
     
-    while not all(not process.running for process in import_processes):
+    while all(not process.running for process in import_processes):
         if args.verbose:
             print("Waiting for import processes to finish...")
             sleep(5)
