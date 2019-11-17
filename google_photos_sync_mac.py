@@ -90,8 +90,6 @@ def main():
                                headers={'Authorization': 'Bearer '+token['access_token']})
         next_page_token = parse_get_mediaitems_response(response, photos)
         
-        # TODO: uncomment:
-        
         # Repeat whilst Google returns a token indicating more items to come
         while next_page_token != None:
             if args.verbose >= 3:
@@ -320,7 +318,6 @@ def import_photos(photos_directory_to_import, photos_library, temp_cache_dir=tem
     
     temp_cache_dir = Path(temp_cache_dir).resolve()
     
-    # TODO: needs to be ful path
     import_library_alias = Path(photos_library).resolve()
     import_library_alias = "Macintosh HD" + str(import_library_alias)
     import_library_alias = import_library_alias.replace('/', ':')
