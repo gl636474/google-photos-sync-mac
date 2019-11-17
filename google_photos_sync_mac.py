@@ -1,3 +1,6 @@
+
+__version__ = "0.6.4"
+
 from pathlib import Path
 from requests.adapters import HTTPAdapter
 from requests_oauthlib import OAuth2Session
@@ -47,7 +50,10 @@ def main():
        * Tidy up cache dirs and wait for any still running sub-processes"""
     args = parse_arguments()
     
-    # Inspect filesystem for photo files. Create dict filename: full_file_path
+    if args.verbose:
+        print('Inspecting photos library: {}'.format(args.mac_photos_library))
+
+    # Create dict filename: full_file_path
     photo_files_on_disk = dict()
     for (dirpath, _, filenames) in os.walk(args.mac_photos_library):
         for filename in filenames:
@@ -62,6 +68,9 @@ def main():
     
     for nickname in get_users(args):
         
+        if args.verbose:
+            print('Processing user {}'.format(nickname))
+        
         user_cache_dir = get_user_cache_dir(args, nickname)
         user_photos_dir = user_cache_dir / users_photos_dir_name
         
@@ -71,8 +80,7 @@ def main():
         user_photos_dir.mkdir()
     
         token_persister = TokenPersister(user_cache_dir)
-        token = token_persister.load_token()
-        session = create_session(args, token, token_persister)
+        session = create_session(nickname, args, token_persister)
 
         if session == None:
             if args.verbose:
@@ -82,6 +90,9 @@ def main():
         
         # Dict of filename: photo_metadata_dict
         photos = dict()
+        
+        # The token should exist now
+        token = token_persister.load_token()
         
         # Get the first batch of photos-metadata and populate photos dict
         if args.verbose:
@@ -107,6 +118,7 @@ def main():
             
         # Compare filenames from Google and filesystem.
         # Create dict of filename: photo_metadata_dict
+        # TODO: THIS DOES NOT WORK ON MAC MINI!!
         photos_to_download = dict()
         for filename in photos:
             if filename not in photo_files_on_disk:
@@ -114,42 +126,51 @@ def main():
         if args.verbose:
             print(len(photos_to_download),'photos need to be downloaded from Google')
         
-        # Download each photo from Google
-        for filename, photo_metadata in photos_to_download.items():
-            # Work out download url
-            mime_type = photo_metadata['mimeType']
-            if mime_type.startswith('image'):
-                url_suffix = '=d'
-            elif mime_type.startswith('video'):
-                url_suffix = '=dv'
-            else:
-                if args.verbose:
-                    print("Skipping download of unknown media type {}: {}"
-                          .format(mime_type, filename))
-                continue
-            url = photo_metadata['baseUrl']+url_suffix
+        if not args.dry_run:
+            # Download each photo from Google
+            for filename, photo_metadata in photos_to_download.items():
+                # Work out download url
+                mime_type = photo_metadata['mimeType']
+                if mime_type.startswith('image'):
+                    url_suffix = '=d'
+                elif mime_type.startswith('video'):
+                    url_suffix = '=dv'
+                else:
+                    if args.verbose:
+                        print("Skipping download of unknown media type {}: {}"
+                              .format(mime_type, filename))
+                    continue
+                url = photo_metadata['baseUrl']+url_suffix
+                
+                try:
+                    file_creation_date = photo_metadata['mediaMetadata']['creationTime']
+                except:
+                    file_creation_date = None
+                
+                download_file(session, url, filename, user_photos_dir, file_creation_date, args.verbose)
             
-            try:
-                file_creation_date = photo_metadata['mediaMetadata']['creationTime']
-            except:
-                file_creation_date = None
-            
-            download_file(session, url, filename, user_photos_dir, file_creation_date, args.verbose)
+            # Import to MacOS Photos - asynchronously
+            process = import_photos(user_photos_dir, args.mac_photos_library, args.cache_dir)
+            import_processes.append(process)
         
-        # Import to MacOS Photos - asynchronously
-        process = import_photos(user_photos_dir, args.mac_photos_library, args.cache_dir)
-        import_processes.append(process)
+        else:
+            # Dry run - jus print out files to download
+            for filename, photo_metadata in photos_to_download.items():
+                mime_type = photo_metadata['mimeType']
+                print('   {} ({})'.format(filename, mime_type))
     
-    while all(not process.running for process in import_processes):
-        if args.verbose:
-            print("Waiting for import processes to finish...")
-            sleep(5)
-    
-    if not args.keep_downloads:
-        for nickname in get_users(args):
-            user_cache_dir = get_user_cache_dir(args, nickname)
-            user_photos_dir = user_cache_dir / users_photos_dir_name
-            shutil.rmtree(user_photos_dir)
+    if not args.dry_run:
+        if len(import_processes) > 0:
+            while all(not process.running for process in import_processes):
+                if args.verbose:
+                    print("Waiting for import processes to finish...")
+                    sleep(5)
+        
+        if not args.keep_downloads:
+            for nickname in get_users(args):
+                user_cache_dir = get_user_cache_dir(args, nickname)
+                user_photos_dir = user_cache_dir / users_photos_dir_name
+                shutil.rmtree(user_photos_dir)
 
 ## ############################################################################
 ## Helper classes
@@ -210,7 +231,8 @@ def error_print(message, code=1):
     print(message, file=sys.stderr)
     exit(code)
 
-def request_new_token(client_id,
+def request_new_token(nickname,
+                      client_id,
                       client_secret,
                       scopes,
                       redirect_uri,
@@ -232,7 +254,8 @@ def request_new_token(client_id,
         authorization_base_url,
         access_type="offline",
         prompt="select_account")
-    print('Please paste this link into your browser to authorize this app to access your Google Photos:')
+    print("Please paste this link into your browser to authorize this app to access {}'s Google Photos:"
+          .format(nickname))
     print(authorization_url)
 
     # Get the authorization verifier code from Google
@@ -270,11 +293,13 @@ def parse_get_mediaitems_response(response, photos):
 
     return next_page_token
 
-def create_session(args, user_token=None, token_persister=None):
+def create_session(nickname, args, token_persister):
     """Create and returns a requests.Session object (with auto-retries
     and auto-token-refresh) either from an existing fresh or stale access token,
-    or from scratch (i.e. asking user to authenticate with Google) - if the
-    user_token argument is None."""
+    or from scratch (i.e. asking user to authenticate with Google)."""
+    
+    user_token = token_persister.load_token()
+    
     if user_token:
         # Silently reuse existing token - oauthlib handles refreshing stale tokens
         session = OAuth2Session(args.client_id,
@@ -284,10 +309,13 @@ def create_session(args, user_token=None, token_persister=None):
                                 token_updater=token_persister)
     elif not args.batch_mode:
         # Need fresh token - will require user to authenticate with Google
-        session = request_new_token(args.client_id, args.client_secret, scopes, 
-                                    args.redirect_uri, args.token_uri, args.extra,
-                                    authorization_base_url, token_persister)
+        session = request_new_token(nickname, args.client_id,
+                                    args.client_secret, scopes,
+                                    args.redirect_uri, args.token_uri,
+                                    args.extra, authorization_base_url,
+                                    token_persister)
     else:
+        # No token at all but we cannot interactively ask for authentication
         return None
     
     # Either way, configure the session
@@ -370,7 +398,8 @@ def parse_arguments():
     authenticate with Google if there is no cached access token; in which case
     that user is ignored. Also do not prompt user if there are no Google client
     credentials cached or supplied on the command line; in which case the
-    program will just terminate.""", action='store_true')
+    program will just terminate. Cannot be used with --add-user.""",
+    action='store_true')
     
     parser.add_argument('-d', '--cache-dir', help="""Use this directory to cache
     Google application credentials file, Google user authentication tokens
@@ -438,8 +467,9 @@ def parse_arguments():
     distinguishes multiple Google syncs on this machine. The NICKNAME will never
     be passed to Google and Google usernames/passwords will never be stored on
     or accessed by this program. The user will be directed to Google to enter
-    username and password to suthenticate this program to access the users
-    photos.""", nargs='+', metavar='NICKNAME', dest='users_to_add')
+    username and password to suthenticate this program to access the user's
+    photos. Adding an already existing user will have no effect. Cannot be used
+    with --batch-mode.""", nargs='+', metavar='NICKNAME', dest='users_to_add')
 
     parser.add_argument('-z', '--remove-user', help="""Removes a google user
     account from the cached accounts to sync. NICKNAME is the same value that
@@ -448,7 +478,19 @@ def parse_arguments():
     that user.""", nargs='+', metavar='NICKNAME',
     dest='users_to_remove')
 
+    parser.add_argument('-y', '--dry-run', help="""Do not download or import
+    photos but just print out the files which would have been downloaded and
+    imported. Any --add-user and --remove-user will still be actionned.""",
+    action='store_true')
+
+    # Help string auto generated. Auto exits after printing version string.
+    parser.add_argument('--version', action='version',
+                        version='%(prog)s {}'.format(__version__))
+
     args = parser.parse_args()
+    
+    if args.users_to_add != None and args.batch_mode:
+        error_print("Cannot specify -a/--add-user and -b/--batch-mode")
     
     if not args.mac_photos_library.is_dir():
         error_print('{} is not a directory or Photos Library'.format(args.mac_photos_library))
@@ -472,7 +514,7 @@ def parse_arguments():
     # Add empty cache-dirs for new users - will prompt later for Google
     # authentication
     if not args.users_to_add == None:
-        for nickname in args.users:
+        for nickname in args.users_to_add:
             user_cache_dir = get_user_cache_dir(args, nickname)
             if not user_cache_dir.exists():
                 user_cache_dir.mkdir(parents=True)
