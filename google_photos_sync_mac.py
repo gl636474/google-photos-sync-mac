@@ -158,8 +158,7 @@ def main():
 class TokenPersister:
     """Saves and loads tokens to/from the filesystem. Handles user-specific
     cache directories. This class defines a __call__() so that an instance can
-    be supplied instead of a method expecting a single argument. The load and
-    save methods of this class will also set the "token" global attribute. """
+    be supplied instead of a method expecting a single argument."""
     
     _token_file_path = None
     _token = None
