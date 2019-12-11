@@ -1,5 +1,7 @@
 
-__version__ = "0.6.4"
+__version__ = "0.7"
+
+# TODO: Handle and continue on download error
 
 from pathlib import Path
 from requests.adapters import HTTPAdapter
@@ -10,9 +12,10 @@ import argparse
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
-from time import strptime, mktime, sleep
+from time import strptime, mktime, sleep, time
 
 ## ############################################################################
 ## Default config - can be overridden by command line arguments
@@ -27,8 +30,11 @@ default_fetch_size = 50
 ## Global config
 ## ############################################################################
 import_applescript_file_name = 'import_photos.applescript'
+list_applescript_file_name = 'list_photos.applescript'
 users_cache_dir_name = 'users'
 users_photos_dir_name = 'photos'
+process_wait_sleep_time = 5 # seconds
+process_wait_completion_time = 600 # seconds
 
 authorization_base_url = "https://accounts.google.com/o/oauth2/v2/auth"
 scopes = ['https://www.googleapis.com/auth/photoslibrary.readonly']
@@ -53,13 +59,11 @@ def main():
     if args.verbose:
         print('Inspecting photos library: {}'.format(args.mac_photos_library))
 
-    # Create dict filename: full_file_path
-    photo_files_on_disk = dict()
-    for (dirpath, _, filenames) in os.walk(args.mac_photos_library):
-        for filename in filenames:
-            photo_files_on_disk[filename] = os.path.join(dirpath, filename)
-    if args.verbose:
-        print (len(photo_files_on_disk),'files found in Photos library on disk')
+    # dict of filename: full_file_path
+    photo_files_on_disk = list_library_photos(args.mac_photos_library, args.verbose, args.case_sensitive)
+    
+    if photo_files_on_disk == None or len(photo_files_on_disk) == 0:
+        error_print("Could not get list of photo filenames from MasOS Photos app")
     
     # The import applescripts run in the background, this list keeps track of
     # the running processes so this script (and therefore child processes) does
@@ -118,11 +122,21 @@ def main():
             
         # Compare filenames from Google and filesystem.
         # Create dict of filename: photo_metadata_dict
-        # TODO: THIS DOES NOT WORK ON MAC MINI!!
         photos_to_download = dict()
         for filename in photos:
-            if filename not in photo_files_on_disk:
+            if args.case_sensitive:
+                need_to_download = filename not in photo_files_on_disk
+            else:
+                need_to_download = filename.lower() not in photo_files_on_disk
+                
+            if need_to_download:
                 photos_to_download[filename] = photos[filename]
+            
+            if args.max_downloads > 0:
+                # We have a maximum number allowed to download
+                if len(photos_to_download) >= args.max_downloads:
+                    break
+        
         if args.verbose:
             print(len(photos_to_download),'photos need to be downloaded from Google')
         
@@ -150,27 +164,56 @@ def main():
                 download_file(session, url, filename, user_photos_dir, file_creation_date, args.verbose)
             
             # Import to MacOS Photos - asynchronously
-            process = import_photos(user_photos_dir, args.mac_photos_library, args.cache_dir)
-            import_processes.append(process)
+            if len(photos_to_download) > 0:
+                if args.verbose:
+                    print("Importing photos...")
+                process = import_photos(user_photos_dir, args.mac_photos_library, args.cache_dir)
+                import_processes.append(process)
+            elif args.verbose:
+                print("No photos to import")
         
         else:
-            # Dry run - jus print out files to download
+            # Dry run - just print out files to download
             for filename, photo_metadata in photos_to_download.items():
                 mime_type = photo_metadata['mimeType']
                 print('   {} ({})'.format(filename, mime_type))
     
+    # End of looping through users to download and import
+    
     if not args.dry_run:
         if len(import_processes) > 0:
-            while all(not process.running for process in import_processes):
+            do_not_wait_beyond_time = time() + process_wait_completion_time
+            while ( any(process.running for process in import_processes) and
+                time() <= do_not_wait_beyond_time ):
+                
                 if args.verbose:
                     print("Waiting for import processes to finish...")
-                    sleep(5)
+                sleep(process_wait_sleep_time)
+            
+            for import_process in import_processes:
+                if import_process.running:
+                    print("Import process {} still running... killing process"
+                          .format(import_process.pid))
+                    import_process.kill()
         
-        if not args.keep_downloads:
-            for nickname in get_users(args):
-                user_cache_dir = get_user_cache_dir(args, nickname)
-                user_photos_dir = user_cache_dir / users_photos_dir_name
-                shutil.rmtree(user_photos_dir)
+        if len(photos_to_download) > 0:
+            if not args.keep_downloads:
+                if args.verbose:
+                    print("Deleting downloaded and imported photos...")
+                for nickname in get_users(args):
+                    user_cache_dir = get_user_cache_dir(args, nickname)
+                    user_photos_dir = user_cache_dir / users_photos_dir_name
+                    shutil.rmtree(user_photos_dir)
+            else:
+                if args.verbose:
+                    print("Downloaded photos have been kept in:")
+                    for nickname in get_users(args):
+                        user_cache_dir = get_user_cache_dir(args, nickname)
+                        user_photos_dir = user_cache_dir / users_photos_dir_name
+                        print("   {}".format(user_photos_dir))
+
+    if args.verbose:
+        print("Done")
 
 ## ############################################################################
 ## Helper classes
@@ -334,7 +377,137 @@ def create_session(nickname, args, token_persister):
     # separately on each request
     
     return session
-   
+
+def list_library_photos_sqlite(photos_library, verbose=False, case_sensitive=False):
+    """Returns a dict of all the photo-file-names in the MacOS Photos library by
+    inspecting the Photos.sqlite database file. Returns None if the file does
+    not exist or is of unexpected format (i.e. difference version of Photos).
+    The key is the photo filename and the value just True."""
+
+    photos_sqlite_db_path = photos_library / 'database' / 'Photos.sqlite'
+    if photos_sqlite_db_path.is_file():
+        
+        if verbose >=2:
+            print("{} is an SQLLite based library".format(photos_library))
+        
+        photos = dict()
+        with sqlite3.connect(photos_sqlite_db_path) as db_conn:
+            db_curs = db_conn.cursor()
+            try:
+                for row in db_curs.execute("""select ZORIGINALFILENAME from ZADDITIONALASSETATTRIBUTES"""):
+                    if case_sensitive:
+                        original_filename = row[0]
+                    else:
+                        original_filename = str(row[0]).lower()
+                    photos[original_filename] = True
+            except:
+                return None
+        return photos
+    else:
+        # Not an sqlite-based version of Photos
+        return None
+    
+def list_library_photos_filesystem(photos_library, verbose=False, case_sensitive=False):
+    """Returns a dict of all the photo-file-names in the MacOS Photos library by
+    inspecting the filesystem. The key is the photo filename, the value the full
+    path to the file. Returns None if the file structure on disk is not as
+    expected (i.e. not a version or configuration of Photos that stores photos
+    as files on disk)."""
+    
+    photos_masters_dir_path = photos_library / 'Masters'
+    if photos_masters_dir_path.is_dir():
+        if any(entry.is_dir() for entry in photos_masters_dir_path.iterdir()):
+
+            if verbose:
+                print("{} is a filesystem based library".format(photos_library))
+
+            photo_files_on_disk = dict()
+            for (dirpath, _, filenames) in os.walk(photos_masters_dir_path):
+                for filename in filenames:
+                    if case_sensitive:
+                        key = filename
+                    else:
+                        key = filename.lower()
+                    photo_files_on_disk[key] = os.path.join(dirpath, filename)
+            
+            return photo_files_on_disk
+    
+    # Not a fielsystem configured version of Photos
+    return None
+
+def list_library_photos_applescript(photos_library, verbose=False, case_sensitive=False):
+    """Returns a dict of all the photo-file-names in the MacOS Photos library by
+    querying Photos using applescript. This should work for all versions of
+    Photos, however it can be slow (up to 5 mins for a library of 20,000 media
+    items. The key is the photo filename and the value just True."""
+
+    list_library_alias = create_macos_alias(photos_library)
+    if verbose:
+        print("Using AppleScript to query library {}".format(list_library_alias))
+
+    list_script = """-- generated file - do not edit
+    
+tell application "Photos"
+    activate
+    delay 2
+    open "{}"
+    delay 2
+    set mediaItems to every media item
+    repeat with mediaItem in mediaItems
+        set mediaItemFileName to filename of mediaItem
+        log (mediaItemFileName as string)
+    end repeat
+end tell
+""".format(list_library_alias)
+
+    list_process = applescript.run(list_script, background=True)
+    while list_process.running:
+        if verbose:
+            print("Waiting for Photos to list all media items...")
+        sleep(process_wait_sleep_time)
+    
+    photos = dict()
+    for line in list_process.text.splitlines():
+        if case_sensitive:
+            photos[line] = True
+        else:
+            photos[line.lower()] = True
+
+    return photos
+
+def list_library_photos(photos_library, verbose=False, case_sensitive=False):
+    """Returns a dict of all the photo-file-names in the MacOS Photos library or
+    None. The key will always be the photo filename. Depending upon the library
+    version, the value may be the full filepath or just True. This method will
+    try several techniques for obtaining the list of photos (fastest first). If
+    all fail, None is returned."""
+    
+    photos_library = Path(photos_library)
+    
+    photos = list_library_photos_sqlite(photos_library, verbose, case_sensitive)
+    
+    if photos == None:
+        photos = list_library_photos_filesystem(photos_library, verbose, case_sensitive)
+    
+    if photos == None:
+        photos = list_library_photos_applescript(photos_library, verbose, case_sensitive)
+  
+    if not photos == None:
+        if verbose:
+            print("Found {} photos in MacOS Photos library".format(len(photos)))
+        if verbose >= 3:
+            for photo_file in photos:
+                print('   {}'.format(photo_file))
+
+    return photos
+    
+def create_macos_alias(path):
+    """Returns a string that is an AppleScript alias representing the supplied path."""
+    alias = Path(path).resolve()
+    alias = "Macintosh HD" + str(alias)
+    alias = alias.replace('/', ':')
+    return alias
+    
 def import_photos(photos_directory_to_import, photos_library, temp_cache_dir=tempfile.gettempdir()):
     """Imports the photos in photos_dirctory_to_import into the specified MacOS
     Photos library. This method needs a temporary directory in which to store
@@ -343,14 +516,8 @@ def import_photos(photos_directory_to_import, photos_library, temp_cache_dir=tem
     directory will be used.""" 
     
     temp_cache_dir = Path(temp_cache_dir).resolve()
-    
-    import_library_alias = Path(photos_library).resolve()
-    import_library_alias = "Macintosh HD" + str(import_library_alias)
-    import_library_alias = import_library_alias.replace('/', ':')
-    
-    import_folder_alias = Path(photos_directory_to_import).resolve()
-    import_folder_alias = "Macintosh HD" + str(import_folder_alias)
-    import_folder_alias = import_folder_alias.replace('/', ':')
+    import_library_alias = create_macos_alias(photos_library)
+    import_folder_alias = create_macos_alias(photos_directory_to_import)
     
     # Double braces to escape
     import_applescript = """-- generated file - do not edit
@@ -393,6 +560,11 @@ def parse_arguments():
     filename, only the last one will be downloaded. If multiple Google Photos
     acounts are scanned, photos with the same filename as an already
     downloaded photo will be skipped.""")
+    
+    parser.add_argument('users', metavar='NICKNAME', nargs='*', help="""Names of
+    users to synchronise. If none specified, all users will be synchronised. If
+    NICKNAME has not previously been added via --add-user it will be ignored.
+    See --list_users.""")
     
     parser.add_argument('-b', '--batch-mode', help="""Do not prompt user to
     authenticate with Google if there is no cached access token; in which case
@@ -443,7 +615,12 @@ def parse_arguments():
     of photos from Google, retrieve in batches of this size. Defaults to {}"""
     .format(default_fetch_size), default=default_fetch_size, type=int)
     
-    parser.add_argument('-m', '--max-retries', help="""Maximum number of retries
+    parser.add_argument('-m', '--max-downloads', help="""Maximum number of
+    photos to downlaod from Google in this execution of this program. This is
+    only useful to perform a quick test run. Negative value means no limit (the
+    default).""", type=int, default=-1)
+    
+    parser.add_argument('-x', '--max-retries', help="""Maximum number of retries
     for each individual GET request to Google. Defaults to {}."""
     .format(default_max_retries_per_request), type=int,
     default=default_max_retries_per_request)
@@ -465,7 +642,7 @@ def parse_arguments():
     parser.add_argument('-a', '--add-user', help="""Add a google user account
     to sync. Note that the NICKNAME is **not** the Google username, it merely
     distinguishes multiple Google syncs on this machine. The NICKNAME will never
-    be passed to Google and Google usernames/passwords will never be stored on
+    be passed to Google and Google usernames/passwords will never be stored
     or accessed by this program. The user will be directed to Google to enter
     username and password to suthenticate this program to access the user's
     photos. Adding an already existing user will have no effect. Cannot be used
@@ -482,12 +659,23 @@ def parse_arguments():
     photos but just print out the files which would have been downloaded and
     imported. Any --add-user and --remove-user will still be actionned.""",
     action='store_true')
+    
+    parser.add_argument('-n', '--case-sensitive', help="""Compare filenames
+    using case sensitive string comparison, so "file.jpg" is considered a
+    different filename to "file.JPG". Default is to ignore case.""",
+    action='store_true')
+    
+    parser.add_argument('-u', '--list-users', help="""List the currently defiend
+    users and exit""", action='store_true')
 
     # Help string auto generated. Auto exits after printing version string.
     parser.add_argument('--version', action='version',
                         version='%(prog)s {}'.format(__version__))
 
     args = parser.parse_args()
+    
+    if args.verbose == None:
+        args.verbose = False
     
     if args.users_to_add != None and args.batch_mode:
         error_print("Cannot specify -a/--add-user and -b/--batch-mode")
@@ -497,6 +685,12 @@ def parse_arguments():
     
     if not args.cache_dir.is_dir():
         args.cache_dir.mkdir(exist_ok=True)
+    
+    if args.list_users:
+        users = get_users(args)
+        for user in users:
+            print(user)
+        exit(0)
     
     # Remove cache-dirs for specified users
     if not args.users_to_remove == None:
@@ -529,6 +723,9 @@ def parse_arguments():
             error_print("No cached credentials file ({}) and no --credentials option specified"
                   .format(e.filename))
     else:
+        # args.credentials_file is already an open file stream (see
+        # parse_argumenrs())
+        #
         # Using specified credentials file, cache it for subsequent use
         try:
             shutil.copyfile(args.credentials_file.name, cached_credentials_file_path)
@@ -624,9 +821,18 @@ def get_users(args):
     users_cache_dir_name directory for subdirectories - each is a user cache."""
     users_directory = args.cache_dir / users_cache_dir_name
     users = []
-    for child in users_directory.iterdir():
-        if child.is_dir():
-            users.append(child.name)
+    if args.users == None or len(args.users) == 0:
+        # Return all users cached in users_cache_dir
+        for child in users_directory.iterdir():
+            if child.is_dir():
+                users.append(child.name)
+    else:
+        # Return args.users who have a directory in users_cache_dir
+        for user in args.users:
+            user_dir = users_directory / user
+            if user_dir.exists():
+                users.append(user)
+    
     return users
     
 ## ############################################################################
