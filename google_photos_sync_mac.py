@@ -2,6 +2,8 @@
 __version__ = "0.7"
 
 # TODO: Handle and continue on download error
+# TODO: Keep track of number of photos actually downloaded/imported
+# TODO: Make a User class contains token and dir names and loop over users
 
 from pathlib import Path
 from requests.adapters import HTTPAdapter
