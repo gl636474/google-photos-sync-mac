@@ -1,5 +1,5 @@
 
-__version__ = "0.8"
+__version__ = "0.9"
 
 from pathlib import Path
 from requests.adapters import HTTPAdapter
@@ -688,11 +688,9 @@ def parse_arguments():
     if not args.cache_dir.is_dir():
         args.cache_dir.mkdir(exist_ok=True)
     
-    if args.list_users:
-        users = get_users(args)
-        for user in users:
-            print(user)
-        exit(0)
+    # If add/remove/list user(s) specified, do those commands and exit otherwise
+    # continue to download/import
+    exit_now = False
     
     # Remove cache-dirs for specified users
     if not args.users_to_remove == None:
@@ -706,6 +704,7 @@ def parse_arguments():
                 user_cache_dir.unlink()
                 if args.verbose:
                     print("Deleted user-cache file(!?) for {}".format(nickname))
+        exit_now = True
 
     # Add empty cache-dirs for new users - will prompt later for Google
     # authentication
@@ -714,7 +713,17 @@ def parse_arguments():
             user_cache_dir = get_user_cache_dir(args, nickname)
             if not user_cache_dir.exists():
                 user_cache_dir.mkdir(parents=True)
+        exit_now = True
     
+    if args.list_users:
+        users = get_users(args)
+        for user in users:
+            print(user)
+        exit_now = True
+
+    if exit_now:
+        exit(0)
+            
     # Read/Store credentials file and read info from it
     cached_credentials_file_path = args.cache_dir / default_credentials_file_name
     if args.credentials_file == None:
