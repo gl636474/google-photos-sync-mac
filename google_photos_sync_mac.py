@@ -1,9 +1,5 @@
 
-__version__ = "0.7"
-
-# TODO: Handle and continue on download error
-# TODO: Keep track of number of photos actually downloaded/imported
-# TODO: Make a User class contains token and dir names and loop over users
+__version__ = "0.8"
 
 from pathlib import Path
 from requests.adapters import HTTPAdapter
@@ -66,11 +62,6 @@ def main():
     
     if photo_files_on_disk == None or len(photo_files_on_disk) == 0:
         error_print("Could not get list of photo filenames from MasOS Photos app")
-    
-    # The import applescripts run in the background, this list keeps track of
-    # the running processes so this script (and therefore child processes) does
-    # not terminate before they have finished.
-    import_processes = []
     
     for nickname in get_users(args):
         
@@ -144,6 +135,7 @@ def main():
         
         if not args.dry_run:
             # Download each photo from Google
+            num_successful_downloads = 0
             for filename, photo_metadata in photos_to_download.items():
                 # Work out download url
                 mime_type = photo_metadata['mimeType']
@@ -163,41 +155,49 @@ def main():
                 except:
                     file_creation_date = None
                 
-                download_file(session, url, filename, user_photos_dir, file_creation_date, args.verbose)
+                if download_file(session, url, filename, user_photos_dir, file_creation_date, args.verbose):
+                    num_successful_downloads += 1
             
-            # Import to MacOS Photos - asynchronously
-            if len(photos_to_download) > 0:
-                if args.verbose:
-                    print("Importing photos...")
-                process = import_photos(user_photos_dir, args.mac_photos_library, args.cache_dir)
-                import_processes.append(process)
-            elif args.verbose:
-                print("No photos to import")
+            if args.verbose:
+                print("{} of {} photos successfully downloaded".format(num_successful_downloads, len(photos_to_download)))
         
+            # Import photos for this user
+            if num_successful_downloads > 0:
+                if args.verbose:
+                    print('Importing photos for user {}'.format(nickname))
+                    
+                user_cache_dir = get_user_cache_dir(args, nickname)
+                user_photos_dir = user_cache_dir / users_photos_dir_name
+    
+                process = import_photos(user_photos_dir, args.mac_photos_library, args.cache_dir)
+    
+                do_not_wait_beyond_time = time() + process_wait_completion_time
+                while ( process.running and time() <= do_not_wait_beyond_time ):
+                    
+                    if args.verbose:
+                        print("Waiting for import process to finish...")
+                    sleep(process_wait_sleep_time)
+                
+                if process.running:
+                    print("Import process {} still running... killing process"
+                          .format(process.pid))
+                    process.kill()
+            
+            else:
+                if args.verbose:
+                    print('Skiping import for user {} - no photos to import'.format(nickname))
+
         else:
             # Dry run - just print out files to download
             for filename, photo_metadata in photos_to_download.items():
                 mime_type = photo_metadata['mimeType']
                 print('   {} ({})'.format(filename, mime_type))
     
-    # End of looping through users to download and import
+    # End of looping through users to download / import
     
     if not args.dry_run:
-        if len(import_processes) > 0:
-            do_not_wait_beyond_time = time() + process_wait_completion_time
-            while ( any(process.running for process in import_processes) and
-                time() <= do_not_wait_beyond_time ):
-                
-                if args.verbose:
-                    print("Waiting for import processes to finish...")
-                sleep(process_wait_sleep_time)
-            
-            for import_process in import_processes:
-                if import_process.running:
-                    print("Import process {} still running... killing process"
-                          .format(import_process.pid))
-                    import_process.kill()
-        
+        # Loop through each user deleting photos
+    
         if len(photos_to_download) > 0:
             if not args.keep_downloads:
                 if args.verbose:
@@ -619,7 +619,7 @@ def parse_arguments():
     
     parser.add_argument('-m', '--max-downloads', help="""Maximum number of
     photos to downlaod from Google in this execution of this program. This is
-    only useful to perform a quick test run. Negative value means no limit (the
+    only useful to perform a quick test_parse_args run. Negative value means no limit (the
     default).""", type=int, default=-1)
     
     parser.add_argument('-x', '--max-retries', help="""Maximum number of retries
@@ -790,6 +790,7 @@ def download_file(session, url, filename, directory, file_creation_timestamp=Non
     Verbose output (if specified) is sent to stdout."""
 
     # Download
+    downloaded = False
     if verbose:
         print("Downloading {}...".format(filename))
     response = session.get(url, stream=True)
@@ -797,22 +798,30 @@ def download_file(session, url, filename, directory, file_creation_timestamp=Non
     # Write to temp file, set dates, rename file to target filename
     temp_file = tempfile.NamedTemporaryFile(dir=directory, delete=False)
     temp_file_path = Path(temp_file.name)
-    with temp_file:
-        for chunk in response.iter_content(chunk_size=128):
-            temp_file.write(chunk)
-    temp_file.close()
-    response.close()
+    try:
+        with temp_file:
+            for chunk in response.iter_content(chunk_size=128):
+                temp_file.write(chunk)
+        
+        if not file_creation_timestamp == None:
+            try:
+                file_creation_time_struct = strptime(file_creation_timestamp, '%Y-%m-%dT%H:%M:%SZ')
+                file_creation_secs = int(mktime(file_creation_time_struct))
+                os.utime(temp_file_path, (file_creation_secs, file_creation_secs))
+            except (OSError, ValueError) as e:
+                if verbose:
+                    print("Error setting file date on {} ({})\n{}"
+                          .format(temp_file_path, file_creation_timestamp, e))
+        temp_file_path.rename(directory / filename)
+        downloaded = True
+    except Exception as e:
+        if verbose >= 2:
+            print("Error downloading {}: {}".format(filename, e))
+    finally:
+        temp_file.close()
+        response.close()
     
-    if not file_creation_timestamp == None:
-        try:
-            file_creation_time_struct = strptime(file_creation_timestamp, '%Y-%m-%dT%H:%M:%SZ')
-            file_creation_secs = int(mktime(file_creation_time_struct))
-            os.utime(temp_file_path, (file_creation_secs, file_creation_secs))
-        except (OSError, ValueError) as e:
-            if verbose:
-                print("Error setting file date on {} ({})\n{}"
-                      .format(temp_file_path, file_creation_timestamp, e))
-    temp_file_path.rename(directory / filename)
+    return downloaded
 
 def get_user_cache_dir(args, nickname):
     """Returns the path to the cache directory for the given user."""
