@@ -3,3 +3,11 @@
 /.project
 /.pydevproject
 /access_token.json
+/Photos.sqlite
+/client_secret.txt
+/google_photos_sync_mac_v0.7.py
+/metaSchema.db
+/photos.db
+/photos_list_out.txt
+/test_lock.py
+/test_parse_args.py
