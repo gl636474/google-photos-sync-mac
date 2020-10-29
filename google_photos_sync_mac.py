@@ -55,7 +55,7 @@ def main():
     args = parse_arguments()
     
     if args.verbose:
-        print('Inspecting photos library: {}'.format(args.mac_photos_library))
+        print('Inspecting photos library: {}'.format(args.mac_photos_library), flush=True)
 
     # dict of filename: full_file_path
     photo_files_on_disk = list_library_photos(args.mac_photos_library, args.verbose, args.case_sensitive)
@@ -66,7 +66,7 @@ def main():
     for nickname in get_users(args):
         
         if args.verbose:
-            print('Processing user {}'.format(nickname))
+            print('Processing user {}'.format(nickname), flush=True)
         
         user_cache_dir = get_user_cache_dir(args, nickname)
         user_photos_dir = user_cache_dir / users_photos_dir_name
@@ -82,7 +82,7 @@ def main():
         if session == None:
             if args.verbose:
                 print("Skipping user {} - no Google acces token. Run interactively (without --batch-mode)."
-                      .format(nickname))
+                      .format(nickname), flush=True)
             continue
         
         # Dict of filename: photo_metadata_dict
@@ -93,7 +93,7 @@ def main():
         
         # Get the first batch of photos-metadata and populate photos dict
         if args.verbose:
-            print("Fetching list of photos from Google...")
+            print("Fetching list of photos from Google...", flush=True)
         response = session.get('https://photoslibrary.googleapis.com/v1/mediaItems',
                                headers={'Authorization': 'Bearer '+token['access_token']})
         next_page_token = parse_get_mediaitems_response(response, photos)
@@ -102,9 +102,9 @@ def main():
         while next_page_token != None:
             if args.verbose >= 3:
                 print('Got {} photos. Fetching next page with token "..{}".'
-                      .format(len(photos), next_page_token[-27:]))
+                      .format(len(photos), next_page_token[-27:]), flush=True)
             elif args.verbose >= 2:
-                print('Got {} photos.'.format(len(photos)))
+                print('Got {} photos.'.format(len(photos)), flush=True)
                 
             response = session.get('https://photoslibrary.googleapis.com/v1/mediaItems',
                                headers={'Authorization': 'Bearer '+token['access_token']},
@@ -131,7 +131,7 @@ def main():
                     break
         
         if args.verbose:
-            print(len(photos_to_download),'photos need to be downloaded from Google')
+            print(len(photos_to_download),'photos need to be downloaded from Google', flush=True)
         
         if not args.dry_run:
             # Download each photo from Google
@@ -159,12 +159,12 @@ def main():
                     num_successful_downloads += 1
             
             if args.verbose:
-                print("{} of {} photos successfully downloaded".format(num_successful_downloads, len(photos_to_download)))
+                print("{} of {} photos successfully downloaded".format(num_successful_downloads, len(photos_to_download)), flush=True)
         
             # Import photos for this user
             if num_successful_downloads > 0:
                 if args.verbose:
-                    print('Importing photos for user {}'.format(nickname))
+                    print('Importing photos for user {}'.format(nickname), flush=True)
                     
                 user_cache_dir = get_user_cache_dir(args, nickname)
                 user_photos_dir = user_cache_dir / users_photos_dir_name
@@ -175,23 +175,23 @@ def main():
                 while ( process.running and time() <= do_not_wait_beyond_time ):
                     
                     if args.verbose:
-                        print("Waiting for import process to finish...")
+                        print("Waiting for import process to finish...", flush=True)
                     sleep(process_wait_sleep_time)
                 
                 if process.running:
                     print("Import process {} still running... killing process"
-                          .format(process.pid))
+                          .format(process.pid), flush=True)
                     process.kill()
             
             else:
                 if args.verbose:
-                    print('Skiping import for user {} - no photos to import'.format(nickname))
+                    print('Skiping import for user {} - no photos to import'.format(nickname), flush=True)
 
         else:
             # Dry run - just print out files to download
             for filename, photo_metadata in photos_to_download.items():
                 mime_type = photo_metadata['mimeType']
-                print('   {} ({})'.format(filename, mime_type))
+                print('   {} ({})'.format(filename, mime_type), flush=True)
     
     # End of looping through users to download / import
     
@@ -201,21 +201,21 @@ def main():
         if len(photos_to_download) > 0:
             if not args.keep_downloads:
                 if args.verbose:
-                    print("Deleting downloaded and imported photos...")
+                    print("Deleting downloaded and imported photos...", flush=True)
                 for nickname in get_users(args):
                     user_cache_dir = get_user_cache_dir(args, nickname)
                     user_photos_dir = user_cache_dir / users_photos_dir_name
                     shutil.rmtree(user_photos_dir)
             else:
                 if args.verbose:
-                    print("Downloaded photos have been kept in:")
+                    print("Downloaded photos have been kept in:", flush=True)
                     for nickname in get_users(args):
                         user_cache_dir = get_user_cache_dir(args, nickname)
                         user_photos_dir = user_cache_dir / users_photos_dir_name
-                        print("   {}".format(user_photos_dir))
+                        print("   {}".format(user_photos_dir), flush=True)
 
     if args.verbose:
-        print("Done")
+        print("Done", flush=True)
 
 ## ############################################################################
 ## Helper classes
@@ -257,13 +257,13 @@ class TokenPersister:
                 with self._token_file_path.open('r') as token_stream:
                     self._token = json.load(token_stream)
             except (json.JSONDecodeError):
-                print('Ignoring badly formatted JSON token file:', self._token_file_path)
+                print('Ignoring badly formatted JSON token file:', self._token_file_path, flush=True)
                 return None
             except (FileNotFoundError):
-                print('No saved token file:', self._token_file_path)
+                print('No saved token file:', self._token_file_path, flush=True)
                 return None
             except (IOError):
-                print('Ignoring inaccessible token file:', self._token_file_path)
+                print('Ignoring inaccessible token file:', self._token_file_path, flush=True)
                 return None
         return self._token
 
@@ -273,7 +273,7 @@ class TokenPersister:
 
 def error_print(message, code=1):
     """Prints the message to stderr and exits with the specified code."""
-    print(message, file=sys.stderr)
+    print(message, file=sys.stderr, flush=True)
     exit(code)
 
 def request_new_token(nickname,
@@ -300,8 +300,8 @@ def request_new_token(nickname,
         access_type="offline",
         prompt="select_account")
     print("Please paste this link into your browser to authorize this app to access {}'s Google Photos:"
-          .format(nickname))
-    print(authorization_url)
+          .format(nickname), flush=True)
+    print(authorization_url, flush=True)
 
     # Get the authorization verifier code from Google
     response_code = input('Paste Google\'s response code here: ')
@@ -332,9 +332,9 @@ def parse_get_mediaitems_response(response, photos):
                 file_name = media_item_meta_data['filename']
                 photos[file_name] = media_item_meta_data
             else:
-                print('Missing filename property in mediaItem - skipping item')
+                print('Missing filename property in mediaItem - skipping item', flush=True)
     else:
-        print('Missing mediaItems property in response - skipping page')
+        print('Missing mediaItems property in response - skipping page', flush=True)
 
     return next_page_token
 
@@ -390,7 +390,7 @@ def list_library_photos_sqlite(photos_library, verbose=False, case_sensitive=Fal
     if photos_sqlite_db_path.is_file():
         
         if verbose >=2:
-            print("{} is an SQLLite based library".format(photos_library))
+            print("{} is an SQLLite based library".format(photos_library), flush=True)
         
         photos = dict()
         with sqlite3.connect(photos_sqlite_db_path) as db_conn:
@@ -421,7 +421,7 @@ def list_library_photos_filesystem(photos_library, verbose=False, case_sensitive
         if any(entry.is_dir() for entry in photos_masters_dir_path.iterdir()):
 
             if verbose:
-                print("{} is a filesystem based library".format(photos_library))
+                print("{} is a filesystem based library".format(photos_library), flush=True)
 
             photo_files_on_disk = dict()
             for (dirpath, _, filenames) in os.walk(photos_masters_dir_path):
@@ -445,7 +445,7 @@ def list_library_photos_applescript(photos_library, verbose=False, case_sensitiv
 
     list_library_alias = create_macos_alias(photos_library)
     if verbose:
-        print("Using AppleScript to query library {}".format(list_library_alias))
+        print("Using AppleScript to query library {}".format(list_library_alias), flush=True)
 
     list_script = """-- generated file - do not edit
     
@@ -465,7 +465,7 @@ end tell
     list_process = applescript.run(list_script, background=True)
     while list_process.running:
         if verbose:
-            print("Waiting for Photos to list all media items...")
+            print("Waiting for Photos to list all media items...", flush=True)
         sleep(process_wait_sleep_time)
     
     photos = dict()
@@ -496,10 +496,10 @@ def list_library_photos(photos_library, verbose=False, case_sensitive=False):
   
     if not photos == None:
         if verbose:
-            print("Found {} photos in MacOS Photos library".format(len(photos)))
+            print("Found {} photos in MacOS Photos library".format(len(photos)), flush=True)
         if verbose >= 3:
             for photo_file in photos:
-                print('   {}'.format(photo_file))
+                print('   {}'.format(photo_file), flush=True)
 
     return photos
     
@@ -699,11 +699,11 @@ def parse_arguments():
             if user_cache_dir.is_dir():
                 shutil.rmtree(user_cache_dir)
                 if args.verbose:
-                    print("Deleted user-cache directory for {}".format(nickname))
+                    print("Deleted user-cache directory for {}".format(nickname), flush=True)
             elif user_cache_dir.is_file():
                 user_cache_dir.unlink()
                 if args.verbose:
-                    print("Deleted user-cache file(!?) for {}".format(nickname))
+                    print("Deleted user-cache file(!?) for {}".format(nickname), flush=True)
         exit_now = True
 
     # Add empty cache-dirs for new users - will prompt later for Google
@@ -718,7 +718,7 @@ def parse_arguments():
     if args.list_users:
         users = get_users(args)
         for user in users:
-            print(user)
+            print(user, flush=True)
         exit_now = True
 
     if exit_now:
@@ -801,7 +801,7 @@ def download_file(session, url, filename, directory, file_creation_timestamp=Non
     # Download
     downloaded = False
     if verbose:
-        print("Downloading {}...".format(filename))
+        print("Downloading {}...".format(filename), flush=True)
     response = session.get(url, stream=True)
     
     # Write to temp file, set dates, rename file to target filename
@@ -820,12 +820,12 @@ def download_file(session, url, filename, directory, file_creation_timestamp=Non
             except (OSError, ValueError) as e:
                 if verbose:
                     print("Error setting file date on {} ({})\n{}"
-                          .format(temp_file_path, file_creation_timestamp, e))
+                          .format(temp_file_path, file_creation_timestamp, e), flush=True)
         temp_file_path.rename(directory / filename)
         downloaded = True
     except Exception as e:
         if verbose >= 2:
-            print("Error downloading {}: {}".format(filename, e))
+            print("Error downloading {}: {}".format(filename, e), flush=True)
     finally:
         temp_file.close()
         response.close()
