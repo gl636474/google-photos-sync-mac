@@ -11,3 +11,7 @@
 /photos_list_out.txt
 /test_lock.py
 /test_parse_args.py
+/release/
+/test_launchd.py
+/error.out
+/log.out
