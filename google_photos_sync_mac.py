@@ -5,6 +5,7 @@ from pathlib import Path
 from requests.adapters import HTTPAdapter
 from requests_oauthlib import OAuth2Session
 from urllib3.util.retry import Retry
+from subprocess import Popen, TimeoutExpired, PIPE
 import applescript
 import argparse
 import json
@@ -169,20 +170,8 @@ def main():
                 user_cache_dir = get_user_cache_dir(args, nickname)
                 user_photos_dir = user_cache_dir / users_photos_dir_name
     
-                process = import_photos(user_photos_dir, args.mac_photos_library, args.cache_dir)
+                import_photos(user_photos_dir, args.mac_photos_library, args.cache_dir, args.verbose)
     
-                do_not_wait_beyond_time = time() + process_wait_completion_time
-                while ( process.running and time() <= do_not_wait_beyond_time ):
-                    
-                    if args.verbose:
-                        print("Waiting for import process to finish...", flush=True)
-                    sleep(process_wait_sleep_time)
-                
-                if process.running:
-                    print("Import process {} still running... killing process"
-                          .format(process.pid), flush=True)
-                    process.kill()
-            
             else:
                 if args.verbose:
                     print('Skiping import for user {} - no photos to import'.format(nickname), flush=True)
@@ -393,6 +382,8 @@ def list_library_photos_sqlite(photos_library, verbose=False, case_sensitive=Fal
             print("{} is an SQLLite based library".format(photos_library), flush=True)
         
         photos = dict()
+        if verbose >=2:
+            print("Opening SQLLite db {}".format(photos_sqlite_db_path))
         with sqlite3.connect(photos_sqlite_db_path) as db_conn:
             db_curs = db_conn.cursor()
             try:
@@ -510,7 +501,7 @@ def create_macos_alias(path):
     alias = alias.replace('/', ':')
     return alias
     
-def import_photos(photos_directory_to_import, photos_library, temp_cache_dir=tempfile.gettempdir()):
+def import_photos(photos_directory_to_import, photos_library, temp_cache_dir=tempfile.gettempdir(), verbose=0):
     """Imports the photos in photos_dirctory_to_import into the specified MacOS
     Photos library. This method needs a temporary directory in which to store
     and run an applescript file. This tempory directory can be explicitly
@@ -548,7 +539,26 @@ end tell
     with applescript_file_path.open('w') as stream:
         stream.write(import_applescript)
     
-    return applescript.run(applescript_file_path, background=False)
+    with Popen(["osascript", applescript_file_path], stdin=sys.stdin, stdout=PIPE, stderr=PIPE, bufsize=1, universal_newlines=True) as p:
+        start_time = time()
+        end_time = start_time + process_wait_completion_time
+        print("will wait {} seconds, untill {} for import sub-process".format(process_wait_completion_time, end_time), flush=True)
+        while p.poll() is None and time() < end_time:
+            try:
+                if verbose >= 2:
+                    print("Communitating with sub-process", flush=True)
+                (import_stdout, import_stderr) = p.communicate(timeout=process_wait_sleep_time)
+                if verbose >=1:
+                    print("Import output>{}".format(import_stdout), flush=True)
+                if import_stdout.strip():
+                    print("Import error>{}".format(import_stderr), flush=True)
+            except TimeoutExpired:
+                if verbose >=2:
+                    print("Timeout after {} seconds - retrying...".format(time - start_time), flush=True)
+
+        if verbose >= 1:
+            print("Import sub-process finished", flush=True)
+    #return applescript.run(applescript_file_path, background=False)
    
     
 def parse_arguments():
