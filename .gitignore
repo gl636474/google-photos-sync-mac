@@ -15,3 +15,10 @@
 /test_launchd.py
 /error.out
 /log.out
+/test_exception.py
+/test_subprocess.py
+/test_thread.py
+/test_window.py
+/google_photos_sync_mac2.py
+/google_photos_sync_mac2_old.py
+/photossync/
