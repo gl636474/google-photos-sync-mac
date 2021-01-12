@@ -554,7 +554,7 @@ end tell
                     print("Import error>{}".format(import_stderr), flush=True)
             except TimeoutExpired:
                 if verbose >=2:
-                    print("Timeout after {} seconds - retrying...".format(time - start_time), flush=True)
+                    print("Timeout after {} seconds - retrying...".format(time() - start_time), flush=True)
 
         if verbose >= 1:
             print("Import sub-process finished", flush=True)
